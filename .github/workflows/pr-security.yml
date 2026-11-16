@@ -6,13 +6,11 @@
 # and run" click needed). They never execute code from the PR: the PR is
 # checked out into a separate folder, without credentials, and only
 # scanned. The install-based signature check executes npm against the
-# PR's files, so it stays on `pull_request`.
+# PR's files, so it lives in pr-package-signatures.yml on `pull_request`.
 name: PR Security Scan
 
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened, ready_for_review]
-  pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
@@ -67,24 +65,3 @@ jobs:
           npx --yes lockfile-lint@4 \
             --path "$GITHUB_WORKSPACE/pr/package-lock.json" \
             --type npm --allowed-hosts npm --validate-https --validate-integrity
-
-  package-signatures:
-    name: Package signatures
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          persist-credentials: false
-
-      - uses: actions/setup-node@v5
-        with:
-          node-version: 22
-          cache: npm
-
-      - name: Install without running install scripts
-        run: npm ci --ignore-scripts
-
-      # Verifies registry signatures and provenance for installed packages.
-      - name: Verify package signatures
-        run: npm audit signatures
