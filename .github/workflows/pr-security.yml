@@ -1,5 +1,5 @@
-# Scans every pull request for malware and malicious or vulnerable
-# dependencies the moment it is opened or updated.
+# Scans every pull request for malicious or vulnerable
+# dependencies (malware scanning and removal: pr-malware-guard.yml) the moment it is opened or updated.
 #
 # Scans that only *read* files run on `pull_request_target`, which starts
 # immediately even for fork PRs from first-time contributors (no "Approve
@@ -67,42 +67,6 @@ jobs:
           npx --yes lockfile-lint@4 \
             --path "$GITHUB_WORKSPACE/pr/package-lock.json" \
             --type npm --allowed-hosts npm --validate-https --validate-integrity
-
-  malware-scan:
-    name: ClamAV scan of changed files
-    if: github.event_name == 'pull_request_target'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out PR files (scan only, never executed)
-        uses: actions/checkout@v5
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          path: pr
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Install ClamAV
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clamav
-          sudo systemctl stop clamav-freshclam || true
-          sudo freshclam
-
-      - name: Scan files changed in this PR
-        working-directory: pr
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          git fetch --no-tags --depth=1 origin "$BASE_SHA" 2>/dev/null || true
-          git diff --name-only --diff-filter=ACMR "$BASE_SHA" "$HEAD_SHA" > "$RUNNER_TEMP/changed.txt"
-          echo "Changed files: $(wc -l < "$RUNNER_TEMP/changed.txt")"
-          if [ ! -s "$RUNNER_TEMP/changed.txt" ]; then
-            echo "No added or modified files to scan."
-            exit 0
-          fi
-          # Exit code 1 means a virus was found; the job fails.
-          clamscan --infected --file-list="$RUNNER_TEMP/changed.txt"
 
   package-signatures:
     name: Package signatures
