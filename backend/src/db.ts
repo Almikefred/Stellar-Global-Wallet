@@ -3,6 +3,7 @@ import { config } from "./config";
 import { ensureDevicesTable } from "./services/deviceRegistry";
 import { ensureVerifiedEmailsTable } from "./services/emailVerification";
 import { ensurePreferencesTable } from "./routes/preferences";
+import { ensureBuiltTransactionsTable } from "./services/builtTransactions";
 
 export const pool = new Pool({ connectionString: config.DATABASE_URL });
 
@@ -42,6 +43,9 @@ export async function ensureAuditTable() {
 
   // #68 — user preferences.
   await ensurePreferencesTable(pool);
+
+  // #194 — hashes of transactions the build endpoints returned.
+  await ensureBuiltTransactionsTable(pool);
 }
 
 export async function ensurePendingTxsTable(db: Pool) {

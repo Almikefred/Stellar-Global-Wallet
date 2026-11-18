@@ -31,6 +31,20 @@ export class LockAcquisitionError extends AppError {
   }
 }
 
+/**
+ * The lock backend itself is down (#197). Fail closed: nothing was
+ * submitted, and the request can be retried once the backend is back.
+ */
+export class LockUnavailableError extends AppError {
+  constructor(message: string) {
+    super(message, {
+      code: "LOCK_UNAVAILABLE",
+      retryable: true,
+      status: 503,
+    });
+  }
+}
+
 export class NonRetryableHorizonError extends HorizonError {
   constructor(message: string, readonly horizonResultCodes?: unknown) {
     super(message, {
@@ -89,10 +103,14 @@ export class SourceAccountNotFoundError extends NotFoundError {
  * passphrase (it was signed for a different network).
  */
 export class InvalidTransactionError extends AppError {
-  constructor(message: string, reason: "MALFORMED_XDR" | "UNSIGNED" | "WRONG_NETWORK") {
+  constructor(
+    message: string,
+    reason: "MALFORMED_XDR" | "UNSIGNED" | "WRONG_NETWORK" | "NOT_BUILT_BY_API" | "ENVELOPE_MODIFIED",
+    extra?: Record<string, unknown>
+  ) {
     super(message, {
       code: "INVALID_TRANSACTION",
-      details: { reason },
+      details: { reason, ...extra },
       retryable: false,
       status: 400,
     });

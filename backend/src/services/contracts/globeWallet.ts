@@ -509,6 +509,26 @@ export class GlobeWalletContract {
   }
 
   /**
+   * Emergency-pause status (#191): whether `send` is paused and who the
+   * pauser is. Reads go through the 15-second simulate cache, so a fresh
+   * pause can take up to that long to show here; the contract itself
+   * enforces the pause immediately.
+   */
+  async getContractStatus(): Promise<{ sendsPaused: boolean; pauser: string | null }> {
+    const contractId = requireContractId();
+    const sourcePublicKey = readOnlySource();
+    const [sendsPaused, pauser] = await Promise.all([
+      withWalletErrorTranslation(
+        this.soroban.simulate<boolean>({ contractId, method: "is_send_paused", sourcePublicKey, args: [] })
+      ),
+      withWalletErrorTranslation(
+        this.soroban.simulate<string | null | undefined>({ contractId, method: "pauser", sourcePublicKey, args: [] })
+      ),
+    ]);
+    return { sendsPaused: sendsPaused === true, pauser: pauser ?? null };
+  }
+
+  /**
    * Read current admin and pending admin candidate (if any) for settings screen (#80).
    * Pending state is null-safe.
    */

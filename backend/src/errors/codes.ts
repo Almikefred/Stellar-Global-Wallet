@@ -18,6 +18,7 @@ export const ERROR_CODES = [
   "ROUTE_NOT_FOUND",
   "PAYLOAD_TOO_LARGE",
   "LOCK_TIMEOUT",
+  "LOCK_UNAVAILABLE",
 
   // Accounts
   "ACCOUNT_NOT_FOUND",

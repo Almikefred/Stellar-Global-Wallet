@@ -1,12 +1,15 @@
 import "dotenv/config";
 import { config } from "./config";
 import { createApp } from "./app";
-import { ensureAuditTable } from "./db";
+import { ensureAuditTable, pool } from "./db";
+import { BuiltTransactionRegistry, PgBuiltTransactionStore } from "./services/builtTransactions";
 import { StellarService } from "./services/stellar";
 import { createAccountLock } from "./services/locks/createAccountLock";
 import { startPaymentNotifier } from "./services/paymentNotifier";
 import { startRecoveryNotifier } from "./services/recoveryNotifier";
 import { getVerifiedAssets } from "./services/verifiedAssets";
+import { startTtlKeeper } from "./services/ttlKeeper";
+import { startUpgradeWatcher } from "./services/upgradeWatcher";
 
 async function main() {
   // #54 — fail fast on a malformed verified-asset list rather than on the
@@ -14,7 +17,9 @@ async function main() {
   getVerifiedAssets();
 
   const { lock, shutdown } = await createAccountLock();
-  const stellar = new StellarService(lock);
+  // #194 — /wallet/submit only relays envelopes built by this API.
+  const builtTxs = new BuiltTransactionRegistry(new PgBuiltTransactionStore(pool), config.NETWORK_PASSPHRASE);
+  const stellar = new StellarService(lock, builtTxs);
   const app = createApp(stellar);
 
   await ensureAuditTable();
@@ -35,7 +40,14 @@ async function main() {
     console.error("[recovery-notifier] fatal error", err.message);
   });
 
+  // #185 — keep active wallets' persistent entries from archiving.
+  const stopTtlKeeper = startTtlKeeper();
+  // #186 — announce proposed/executed contract upgrades.
+  const stopUpgradeWatcher = startUpgradeWatcher();
+
   const shutdownGracefully = async (signal: string) => {
+    stopTtlKeeper();
+    stopUpgradeWatcher();
     console.log(`${signal} received, shutting down`);
     server.close(async () => {
       await shutdown();

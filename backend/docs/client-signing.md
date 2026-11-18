@@ -51,13 +51,25 @@ The backend also exposes `POST /api/v1/contract/wallet/assets/build` and
 registry. Those routes return unsigned XDR; native XLM uses
 `{ code: "XLM", issuer: null }`.
 
-## Submission availability
+## Submission
 
-This API version does not expose a generic endpoint for submitting
-client-signed XDR. Do not assume that `/wallet/submit` exists, and do not use a
-deprecated secret-key route as a substitute. Submission of client-signed XDR
-is outside the scope of the trustline, asset-registry, configuration, and
-deprecation changes documented here.
+`POST /api/v1/wallet/submit` relays a client-signed envelope, but only one
+this API built (#194). Each build endpoint records the hash of the unsigned
+transaction with its intent, source account, sequence, network and expiry.
+On submit the backend decodes the envelope and matches the (inner)
+transaction hash against those records. Signing doesn't change the hash, but
+any edit does, so:
+
+- Sign the XDR exactly as returned. Wrapping it in a fee-bump is fine.
+- An edited envelope (extra operation, other fee, other destination) is
+  refused with `INVALID_TRANSACTION`, reason `ENVELOPE_MODIFIED`.
+- A transaction no build endpoint returned is refused with reason
+  `NOT_BUILT_BY_API`.
+- Past `timeBounds.maxTime` it is `TX_EXPIRED`. Build again.
+
+This keeps the API from acting as an open relay for arbitrary signed
+transactions under its rate limits or fee sponsorship. Refusals are counted in
+`wallet_submit_rejected_total{reason}` at `GET /api/v1/health/metrics`.
 
 ## Wallet signing
 
