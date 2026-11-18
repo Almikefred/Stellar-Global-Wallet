@@ -39,6 +39,8 @@ Every state mutation in `GlobeWallet` emits at least one event with sufficient c
 | `pause_sends(caller)` | `"sends_paused"` | `("sends_paused",)` | `(caller: Address, ledger: u32)` | Pauser or admin stops `send`. Not emitted when already paused. |
 | `unpause_sends(admin)` | `"sends_unpaused"` | `("sends_unpaused",)` | `(admin: Address, ledger: u32)` | Admin resumes `send`. Not emitted when not paused. |
 | `migrate_user_assets(admin, user)` | `"user_assets_migrated"` | `("user_assets_migrated",)` | `(user: Address, removed: u32)` | Trims user asset list to MAX_ASSETS if exceeded. |
+| `extend_user_ttl(user)` | `"user_ttl_extended"` | `("user_ttl_extended",)` | `(user: Address, extended: u32)` | Permissionless keeper call extended the TTL of `extended` per-user entries (#185). |
+| token-wrapper `extend_allowance_ttl(owner, spender)` | `"allowance_ttl_extended"` | `("allowance_ttl_extended",)` | `(owner: Address, spender: Address, extend_to: u32)` | Keeper re-extended an allowance's TTL up to its `expiry_ledger` (#185). |
 
 ---
 

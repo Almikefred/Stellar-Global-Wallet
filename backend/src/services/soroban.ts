@@ -44,6 +44,37 @@ export interface PreparedInvocation extends UnsignedTransactionInfo {
   authEntries: string[];
   /** Ledger the simulation ran against. */
   latestLedger: number;
+  /**
+   * Present when simulation found archived entries in the footprint (#185):
+   * an unsigned RestoreFootprint transaction that must be signed and
+   * submitted *before* the main transaction. The main transaction's
+   * sequence number already accounts for it (restore = n+1, invoke = n+2).
+   */
+  restore?: {
+    transactionXdr: string;
+    hash: string;
+    minResourceFee: string;
+  };
+}
+
+/**
+ * Builds a RestoreFootprint transaction from a simulation's
+ * `restorePreamble` (#185). The resource fee from the preamble is added to
+ * the base fee, and the preamble's footprint is attached as Soroban data so
+ * the network restores exactly the archived entries the invocation needs.
+ */
+export function buildRestoreTransaction(
+  sourceAccount: StellarSdk.Account,
+  restorePreamble: { minResourceFee: string; transactionData: StellarSdk.SorobanDataBuilder },
+  networkPassphrase: string,
+  timeoutSeconds = 30
+): StellarSdk.Transaction {
+  const fee = (BigInt(StellarSdk.BASE_FEE) + BigInt(restorePreamble.minResourceFee)).toString();
+  return new StellarSdk.TransactionBuilder(sourceAccount, { fee, networkPassphrase })
+    .setSorobanData(restorePreamble.transactionData.build())
+    .addOperation(StellarSdk.Operation.restoreFootprint({}))
+    .setTimeout(timeoutSeconds)
+    .build();
 }
 
 export class SorobanService {
@@ -118,20 +149,35 @@ export class SorobanService {
   }): Promise<ContractCallResult<T>> {
     const { contractId, method, args, sourceSecretKey } = params;
     const keypair = StellarSdk.Keypair.fromSecret(sourceSecretKey);
-    const sourceAccount = await this.server.getAccount(keypair.publicKey());
-    const tx = this.buildInvocation(sourceAccount, contractId, method, args);
+    let sourceAccount = await this.server.getAccount(keypair.publicKey());
+    let tx = this.buildInvocation(sourceAccount, contractId, method, args);
 
     // Simulation-before-submission: this is what lets us reject a doomed
     // call (bad args, insufficient auth, a contract error like
     // SpendLimitExceeded) before ever paying network fees or waiting on
     // ledger close. sendTransaction is never reached below this point on a
     // failed simulation.
-    const sim = await this.server.simulateTransaction(tx);
+    let sim = await this.server.simulateTransaction(tx);
     if (rpc.Api.isSimulationError(sim)) {
       throw new SorobanSimulationError(
         `Simulation failed for ${contractId}.${method}: ${sim.error}`,
         sim.error
       );
+    }
+
+    // #185 — archived entries in the footprint: restore them first, then
+    // rebuild and re-simulate against the restored state.
+    if (rpc.Api.isSimulationRestore(sim)) {
+      await this.submitRestore(keypair, sim.restorePreamble);
+      sourceAccount = await this.server.getAccount(keypair.publicKey());
+      tx = this.buildInvocation(sourceAccount, contractId, method, args);
+      sim = await this.server.simulateTransaction(tx);
+      if (rpc.Api.isSimulationError(sim)) {
+        throw new SorobanSimulationError(
+          `Simulation failed for ${contractId}.${method} after restore: ${sim.error}`,
+          sim.error
+        );
+      }
     }
 
     const prepared = rpc.assembleTransaction(tx, sim).build();
@@ -165,6 +211,30 @@ export class SorobanService {
       `${contractId}.${method} did not reach a final status within ${POLL_TIMEOUT_MS}ms (hash ${send.hash})`,
       send.hash
     );
+  }
+
+  /** Signs, submits and waits for a RestoreFootprint transaction (#185). */
+  private async submitRestore(
+    keypair: StellarSdk.Keypair,
+    preamble: { minResourceFee: string; transactionData: StellarSdk.SorobanDataBuilder }
+  ): Promise<void> {
+    const account = await this.server.getAccount(keypair.publicKey());
+    const restoreTx = buildRestoreTransaction(account, preamble, this.networkPassphrase);
+    restoreTx.sign(keypair);
+    const send = await this.server.sendTransaction(restoreTx);
+    if (send.status === "ERROR") {
+      throw new SorobanSimulationError(
+        "RestoreFootprint was rejected before entering the ledger",
+        send.errorResult ? send.errorResult.toXDR("base64") : send.status
+      );
+    }
+    const final = await this.pollTransaction(send.hash);
+    if (final.status !== rpc.Api.GetTransactionStatus.SUCCESS) {
+      throw new SorobanTransactionError(
+        `RestoreFootprint did not succeed (hash ${send.hash}, status ${final.status})`,
+        send.hash
+      );
+    }
   }
 
   private buildInvocation(
@@ -243,12 +313,38 @@ export class SorobanService {
       );
     }
 
-    const prepared = rpc.assembleTransaction(tx, sim).build();
+    // #185 — archived entries: hand back a RestoreFootprint tx to sign
+    // first (sequence n+1) and rebuild the invocation at n+2 so both can be
+    // submitted back to back without another round trip.
+    let restore: PreparedInvocation["restore"];
+    let invocationTx = tx;
+    if (rpc.Api.isSimulationRestore(sim)) {
+      // Building `tx` above bumped `sourceAccount` to n+1; start again from n.
+      const base = new StellarSdk.Account(
+        sourcePublicKey,
+        (BigInt(sourceAccount.sequenceNumber()) - 1n).toString()
+      );
+      const restoreTx = buildRestoreTransaction(
+        base,
+        sim.restorePreamble,
+        this.networkPassphrase,
+        BUILD_TIMEOUT_SECONDS
+      );
+      restore = {
+        transactionXdr: restoreTx.toXDR(),
+        hash: restoreTx.hash().toString("hex"),
+        minResourceFee: sim.restorePreamble.minResourceFee,
+      };
+      invocationTx = this.buildInvocation(base, contractId, method, args, BUILD_TIMEOUT_SECONDS);
+    }
+
+    const prepared = rpc.assembleTransaction(invocationTx, sim).build();
     return {
       ...describeUnsignedTransaction(prepared, this.networkPassphrase),
       minResourceFee: sim.minResourceFee,
       authEntries: (sim.result?.auth ?? []).map((entry) => entry.toXDR("base64")),
       latestLedger: sim.latestLedger,
+      ...(restore ? { restore } : {}),
     };
   }
 
@@ -319,6 +415,23 @@ export class SorobanService {
     }
 
     return tx.toXDR();
+  }
+
+  /**
+   * Reads `liveUntilLedgerSeq` for each ledger key (#185 TTL keeper). Keys
+   * that have no live entry (never written, or archived) are absent from
+   * the returned map, keyed by the base64 XDR of the LedgerKey.
+   */
+  async getLiveUntil(keys: StellarSdk.xdr.LedgerKey[]): Promise<Map<string, number>> {
+    const out = new Map<string, number>();
+    if (keys.length === 0) return out;
+    const res = await this.server.getLedgerEntries(...keys);
+    for (const entry of res.entries) {
+      if (typeof entry.liveUntilLedgerSeq === "number") {
+        out.set(entry.key.toXDR("base64"), entry.liveUntilLedgerSeq);
+      }
+    }
+    return out;
   }
 
   /**

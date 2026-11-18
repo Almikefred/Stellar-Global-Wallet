@@ -231,6 +231,13 @@ const SECONDS_PER_DAY: u64 = 86_400;
 const PERSISTENT_TTL_THRESHOLD: u32 = LEDGERS_PER_DAY * 7; // ~7 days
 const PERSISTENT_TTL_EXTEND_TO: u32 = LEDGERS_PER_DAY * 30; // ~30 days
 
+/// `LimitOptIn` markers (issue #185) are extended much further than the
+/// entries they guard, so the marker always outlives the `SpendLimit` it
+/// vouches for. 180 days stays well under the network's `max_entry_ttl`
+/// (~1 year).
+const OPT_IN_TTL_THRESHOLD: u32 = LEDGERS_PER_DAY * 30;
+const OPT_IN_TTL_EXTEND_TO: u32 = LEDGERS_PER_DAY * 180;
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -517,6 +524,12 @@ impl GlobeWallet {
     /// `recovery_quorum_reached` event, without needlessly delaying a
     /// legitimate lost-device recovery that quorum has already vetted.
     pub const MIN_RECOVERY_DELAY_LEDGERS: u32 = LEDGERS_PER_DAY;
+
+    /// How often (in ledgers) an off-chain keeper should call
+    /// [`Self::extend_user_ttl`] for each active wallet (issue #185). One
+    /// day — the shortest threshold of any per-user entry (`DailySpent`) —
+    /// so no entry can slip past its threshold between keeper runs.
+    pub const KEEPER_INTERVAL_LEDGERS: u32 = LEDGERS_PER_DAY;
 
     /// Initialize the contract with an admin address.
     ///
@@ -1390,11 +1403,82 @@ impl GlobeWallet {
     }
 
     /// Get the daily spend limit for a user/asset pair (0 = unlimited).
+    ///
+    /// Fails closed (issue #185): if the user opted into a limit for this
+    /// asset (`LimitOptIn` marker present) but the `SpendLimit` entry is
+    /// missing, this panics with [`WalletError::SpendLimitArchived`] rather
+    /// than reporting "unlimited". `record_spend` and `send` go through this
+    /// function, so an archived limit blocks spending until it is restored.
     pub fn get_spend_limit(env: Env, user: Address, asset_code: String) -> i128 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::SpendLimit(user, asset_code))
-            .unwrap_or(0)
+        match Self::effective_limit(&env, &user, &asset_code) {
+            Ok(limit) => limit,
+            Err(e) => panic_with_error!(&env, e),
+        }
+    }
+
+    /// `true` when `(user, asset_code)` opted into a limit whose entry is
+    /// now missing — i.e. spending is blocked until a restore. Never panics,
+    /// so keepers and UIs can probe it safely (issue #185).
+    pub fn is_limit_archived(env: Env, user: Address, asset_code: String) -> bool {
+        Self::effective_limit(&env, &user, &asset_code).is_err()
+    }
+
+    /// Permissionless TTL keeper (issue #185): extends every persistent
+    /// entry belonging to `user` (`UserAssets`, and per registered asset its
+    /// `SpendLimit`, `LimitOptIn` and `DailySpent`) plus the contract
+    /// instance. Anyone may pay to keep a wallet alive; it changes no values,
+    /// only lifetimes, so no auth is required. Returns the number of entries
+    /// extended. Entries that are already archived are skipped (they need a
+    /// `RestoreFootprint` operation, which the backend adds automatically).
+    pub fn extend_user_ttl(env: Env, user: Address) -> u32 {
+        Self::bump_instance_ttl(&env);
+        let storage = env.storage().persistent();
+        let mut extended: u32 = 0;
+        let assets_key = DataKey::UserAssets(user.clone());
+        let assets: Vec<AssetInfo> = match storage.get(&assets_key) {
+            Some(a) => {
+                storage.extend_ttl(&assets_key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+                extended += 1;
+                a
+            }
+            None => Vec::new(&env),
+        };
+        for asset in assets.iter() {
+            let limit_key = DataKey::SpendLimit(user.clone(), asset.code.clone());
+            if storage.has(&limit_key) {
+                storage.extend_ttl(&limit_key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+                extended += 1;
+            }
+            let opt_key = DataKey::LimitOptIn(user.clone(), asset.code.clone());
+            if storage.has(&opt_key) {
+                storage.extend_ttl(&opt_key, OPT_IN_TTL_THRESHOLD, OPT_IN_TTL_EXTEND_TO);
+                extended += 1;
+            }
+            let spent_key = DataKey::DailySpent(user.clone(), asset.code.clone());
+            if storage.has(&spent_key) {
+                storage.extend_ttl(&spent_key, DAILY_SPENT_TTL_THRESHOLD, DAILY_SPENT_TTL_EXTEND_TO);
+                extended += 1;
+            }
+        }
+        env.events().publish(
+            (Symbol::new(&env, "user_ttl_extended"),),
+            (user, extended),
+        );
+        extended
+    }
+
+    fn effective_limit(env: &Env, user: &Address, asset_code: &String) -> Result<i128, WalletError> {
+        let storage = env.storage().persistent();
+        match storage.get::<_, i128>(&DataKey::SpendLimit(user.clone(), asset_code.clone())) {
+            Some(limit) => Ok(limit),
+            None => {
+                if storage.has(&DataKey::LimitOptIn(user.clone(), asset_code.clone())) {
+                    Err(WalletError::SpendLimitArchived)
+                } else {
+                    Ok(0)
+                }
+            }
+        }
     }
 
     /// Amount spent by `user` in `asset_code` during the current day window
@@ -1485,7 +1569,7 @@ impl GlobeWallet {
         // instance storage from silently drifting toward archival (see
         // `bump_instance_ttl`'s doc comment).
         Self::bump_instance_ttl(&env);
-        let limit = Self::get_spend_limit(env.clone(), user.clone(), asset_code.clone());
+        let limit = Self::effective_limit(&env, &user, &asset_code)?;
         if limit == 0 {
             // No limit configured → always allow
             return Ok(());
@@ -2056,6 +2140,7 @@ impl GlobeWallet {
             let dropped = assets.get(i).unwrap();
             env.storage().persistent().remove(&DataKey::SpendLimit(user.clone(), dropped.code.clone()));
             env.storage().persistent().remove(&DataKey::DailySpent(user.clone(), dropped.code.clone()));
+            env.storage().persistent().remove(&DataKey::LimitOptIn(user.clone(), dropped.code.clone()));
         }
         env.storage()
             .persistent()
@@ -4841,5 +4926,80 @@ mod tests {
         // either way) confirms setup was correct and we're not passing
         // vacuously because the limit was never configured.
         assert_eq!(client.get_spend_limit(&user, &code), 1_000_000);
+    }
+
+    // ── Archival fails safe (issue #185) ────────────────────────────────
+
+    /// Simulates archival of the `SpendLimit` entry by deleting it out from
+    /// under the contract; the opt-in marker survives, so the spend must be
+    /// rejected rather than treated as unlimited.
+    #[test]
+    fn test_archived_spend_limit_fails_safe() {
+        let (env, cid, _admin, client) = setup();
+        let user = Address::generate(&env);
+        let code = String::from_str(&env, "XLM");
+        client.set_spend_limit(&user, &code, &100_i128);
+        env.as_contract(&cid, || {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::SpendLimit(user.clone(), code.clone()));
+        });
+        assert!(client.is_limit_archived(&user, &code));
+        assert_eq!(
+            client.try_record_spend(&user, &code, &1_000_000_i128),
+            Err(Ok(WalletError::SpendLimitArchived))
+        );
+        assert_eq!(
+            client.try_get_spend_limit(&user, &code),
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                WalletError::SpendLimitArchived as u32
+            )))
+        );
+    }
+
+    #[test]
+    fn test_cleared_limit_removes_opt_in_marker() {
+        let (env, cid, _admin, client) = setup();
+        let user = Address::generate(&env);
+        let code = String::from_str(&env, "XLM");
+        client.set_spend_limit(&user, &code, &100_i128);
+        client.set_spend_limit(&user, &code, &0_i128);
+        env.as_contract(&cid, || {
+            assert!(!env
+                .storage()
+                .persistent()
+                .has(&DataKey::LimitOptIn(user.clone(), code.clone())));
+            env.storage()
+                .persistent()
+                .remove(&DataKey::SpendLimit(user.clone(), code.clone()));
+        });
+        // Never opted in (any more) → missing entry really means unlimited.
+        assert!(!client.is_limit_archived(&user, &code));
+        client.record_spend(&user, &code, &1_000_000_i128);
+    }
+
+    #[test]
+    fn test_extend_user_ttl_keeps_entries_alive() {
+        let (env, _cid, _admin, client) = setup();
+        let user = Address::generate(&env);
+        let code = String::from_str(&env, "XLM");
+        client.add_asset(&user, &xlm(&env));
+        client.set_spend_limit(&user, &code, &1_000_i128);
+        client.record_spend(&user, &code, &10_i128);
+        // UserAssets + SpendLimit + LimitOptIn + DailySpent
+        assert_eq!(client.extend_user_ttl(&user), 4);
+        for _ in 0..3 {
+            env.ledger().with_mut(|l| l.sequence_number += GlobeWallet::KEEPER_INTERVAL_LEDGERS);
+            client.extend_user_ttl(&user);
+        }
+        assert_eq!(client.get_spend_limit(&user, &code), 1_000);
+        assert_eq!(client.get_assets(&user).len(), 1);
+    }
+
+    #[test]
+    fn test_extend_user_ttl_unknown_user_is_noop() {
+        let (env, _cid, _admin, client) = setup();
+        let user = Address::generate(&env);
+        assert_eq!(client.extend_user_ttl(&user), 0);
     }
 }

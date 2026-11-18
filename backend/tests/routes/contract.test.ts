@@ -237,3 +237,17 @@ describe("POST /api/v1/contract/admin/{propose,accept,cancel} unsigned XDR build
   });
 });
 
+
+describe("GET /api/v1/contract/upgrade/status (issue #186)", () => {
+  it("is public and reports watcher state alongside the on-chain timelock", async () => {
+    const getPendingUpgrade = jest.fn().mockResolvedValue(null);
+    const app = buildApp({ getPendingUpgrade });
+
+    const res = await request(app).get("/api/v1/contract/upgrade/status").expect(200);
+
+    expect(res.body.pendingUpgrade).toBeNull();
+    expect(res.body.watcher).toEqual(
+      expect.objectContaining({ watching: false, pending: null, history: [] })
+    );
+  });
+});

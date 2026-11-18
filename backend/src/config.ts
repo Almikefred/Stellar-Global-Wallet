@@ -205,6 +205,29 @@ const envSchema = z.object({
   // Upper bound on operations examined per filtered history page (#58).
   HISTORY_SCAN_CAP: z.coerce.number().int().positive().max(10000).default(1000),
 
+  // #185 — TTL keeper job. Disabled unless a funded fee-payer secret is set;
+  // the key only pays fees for the permissionless `extend_user_ttl` /
+  // RestoreFootprint transactions and never needs any wallet's authority.
+  TTL_KEEPER_SECRET_KEY: z
+    .string()
+    .regex(/^S[A-Z2-7]{55}$/, "must be a Stellar secret seed (S...)")
+    .optional(),
+  // How often the keeper sweeps active wallets (default: every 6 hours,
+  // well inside the contract's 1-day KEEPER_INTERVAL_LEDGERS).
+  TTL_KEEPER_INTERVAL_MS: z.coerce.number().int().positive().default(6 * 60 * 60 * 1000),
+  // Alert when an entry has fewer than this many ledgers left (~3 days).
+  TTL_KEEPER_ALERT_LEDGERS: z.coerce.number().int().positive().default(17_280 * 3),
+  // A wallet is "active" if one of its devices was seen within this many days.
+  TTL_KEEPER_ACTIVE_DAYS: z.coerce.number().int().positive().default(90),
+
+  // #185/#186 — optional ops webhook (Slack/Discord/PagerDuty-compatible JSON
+  // POST) for near-expiry and upgrade-proposed alerts. Alerts are always
+  // logged; the webhook is an extra channel.
+  OPS_ALERT_WEBHOOK_URL: z.string().url().optional(),
+
+  // #186 — upgrade watcher poll interval.
+  UPGRADE_WATCHER_POLL_MS: z.coerce.number().int().positive().default(30_000),
+
   // #16 — interactive API docs (Swagger UI at /api/docs, raw spec at
   // /api/openapi.json). Defaults to enabled outside production and disabled
   // in production so a prod build never exposes docs unless explicitly
