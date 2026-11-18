@@ -99,6 +99,33 @@ impl TokenWrapper {
             .unwrap_or(Allowance { amount: 0, expiry_ledger: 0 })
     }
 
+    /// Permissionless TTL keeper for one allowance (issue #185).
+    ///
+    /// Re-extends the `(owner, spender)` entry so storage never archives it
+    /// before its own `expiry_ledger`. Values are untouched, so no auth is
+    /// needed — anyone (the backend keeper job) may pay for it. Returns the
+    /// number of ledgers the entry was extended to live for (0 when the pair
+    /// has no allowance or it has already expired, in which case there is
+    /// nothing worth keeping alive).
+    pub fn extend_allowance_ttl(env: Env, owner: Address, spender: Address) -> u32 {
+        let key = WrapperDataKey::Allowance(owner.clone(), spender.clone());
+        let current: Option<Allowance> = env.storage().persistent().get(&key);
+        let extend_to = match current {
+            Some(a) if a.expiry_ledger >= env.ledger().sequence() => {
+                a.expiry_ledger.saturating_sub(env.ledger().sequence())
+            }
+            _ => 0,
+        };
+        if extend_to > 0 {
+            env.storage().persistent().extend_ttl(&key, extend_to, extend_to);
+            env.events().publish(
+                (Symbol::new(&env, "allowance_ttl_extended"),),
+                (owner, spender, extend_to),
+            );
+        }
+        extend_to
+    }
+
     /// Transfer tokens from `from` to `to` using a previously granted allowance.
     ///
     /// Decrements the allowance; fails if expired or insufficient.
@@ -373,5 +400,29 @@ mod tests {
         client.approve(&owner, &spender, &500, &200);
         env.ledger().with_mut(|l| l.sequence_number = 200); // exactly at expiry_ledger
         client.transfer_from(&spender, &token_id, &owner, &to, &100); // currently succeeds — lock this in explicitly
+    }
+
+    #[test]
+    fn test_extend_allowance_ttl_reports_remaining_lifetime() {
+        let (env, _id, client) = setup();
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+        client.approve(&owner, &spender, &500, &5_000);
+        env.ledger().with_mut(|l| l.sequence_number = 1_000);
+        assert_eq!(client.extend_allowance_ttl(&owner, &spender), 4_000);
+        assert_eq!(client.allowance(&owner, &spender).amount, 500);
+    }
+
+    #[test]
+    fn test_extend_allowance_ttl_missing_or_expired_is_noop() {
+        let (env, _id, client) = setup();
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        assert_eq!(client.extend_allowance_ttl(&owner, &spender), 0);
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+        client.approve(&owner, &spender, &500, &200);
+        env.ledger().with_mut(|l| l.sequence_number = 201);
+        assert_eq!(client.extend_allowance_ttl(&owner, &spender), 0);
     }
 }

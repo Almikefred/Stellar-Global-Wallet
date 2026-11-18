@@ -227,6 +227,49 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+  /contract/upgrade/status:
+    get:
+      tags: [contract]
+      summary: Public contract-upgrade announcements (#186)
+      description: >
+        On-chain pending upgrade (timelock) plus what the backend upgrade
+        watcher has observed from `upgrade_proposed` / `upgrade_executed`
+        events. `watcher.watching` is false when the worker is not running.
+        No authentication required.
+      operationId: getUpgradeStatus
+      security: []
+      responses:
+        '200':
+          description: Upgrade status
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [pendingUpgrade, watcher]
+                properties:
+                  pendingUpgrade:
+                    nullable: true
+                    type: object
+                    properties:
+                      wasmHash: { type: string }
+                      proposedBy: { type: string }
+                      readyAtLedger: { type: integer }
+                      executableAt: { type: string, format: date-time, nullable: true }
+                  watcher:
+                    type: object
+                    required: [watching, history]
+                    properties:
+                      contractId: { type: string, nullable: true }
+                      watching: { type: boolean }
+                      lastCheckedLedger: { type: integer, nullable: true }
+                      pending:
+                        nullable: true
+                        allOf:
+                          - $ref: '#/components/schemas/UpgradeEvent'
+                      history:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/UpgradeEvent'
   /contract/{contractId}:
     parameters:
       - $ref: '#/components/parameters/ContractId'
@@ -1187,6 +1230,18 @@ components:
           schema:
             $ref: '#/components/schemas/ErrorEnvelope'
   schemas:
+    UpgradeEvent:
+      type: object
+      required: [kind, eventId, ledger, actor, wasmHash]
+      properties:
+        kind: { type: string, enum: [proposed, executed] }
+        eventId: { type: string }
+        ledger: { type: integer }
+        txHash: { type: string }
+        actor: { type: string, description: Proposer or executor address }
+        wasmHash: { type: string, description: Hex-encoded WASM hash }
+        readyAtLedger: { type: integer, description: Only for proposed }
+        estimatedExecutableAt: { type: string, format: date-time, nullable: true }
     FeeTier:
       type: object
       required: [stroops, xlm]
