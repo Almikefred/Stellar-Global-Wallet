@@ -62,7 +62,7 @@ describe("createAccountLock", () => {
 
       const handle = await createAccountLock();
 
-      expect(createClient).toHaveBeenCalledWith({ url: "redis://127.0.0.1:6379" });
+      expect(createClient).toHaveBeenCalledWith({ url: "redis://127.0.0.1:6379", disableOfflineQueue: true });
       expect(mockClient.on).toHaveBeenCalledWith("error", expect.any(Function));
       expect(mockClient.connect).toHaveBeenCalledTimes(1);
       expect(handle.lock).toBeInstanceOf(RedisAccountLock);
@@ -70,6 +70,13 @@ describe("createAccountLock", () => {
       expect(mockClient.quit).not.toHaveBeenCalled();
       await handle.shutdown();
       expect(mockClient.quit).toHaveBeenCalledTimes(1);
+    });
+
+    it("fails closed when Redis is configured but unreachable at startup", async () => {
+      (config as { LOCK_BACKEND: string | undefined }).LOCK_BACKEND = "redis";
+      mockClient.connect.mockRejectedValue(new Error("ECONNREFUSED"));
+
+      await expect(createAccountLock()).rejects.toThrow("ECONNREFUSED");
     });
 
     it("registers an error handler that logs redis client errors", async () => {

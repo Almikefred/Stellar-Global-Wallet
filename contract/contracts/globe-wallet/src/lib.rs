@@ -1873,6 +1873,12 @@ impl GlobeWallet {
         // ExistingValue` / "frame is already authorized"), so this function
         // must not call it a second time itself.
 
+        // 0. Emergency pause (issue #191). Checked before anything else so a
+        //    paused contract never touches the spend counter or calls out.
+        if Self::is_send_paused(env.clone()) {
+            return Err(WalletError::SendsPaused);
+        }
+
         // 1. Allowlist check — see threat-model doc §4, mitigation 1. Done
         //    first and before any state mutation so a disallowed token_id
         //    never touches the daily-spend counter at all. This does not
@@ -1935,6 +1941,87 @@ impl GlobeWallet {
             // the record_spend write above) reverts.
             Ok(Err(_)) | Err(_) => Err(WalletError::TokenTransferFailed),
         }
+    }
+
+    // ── Emergency pause (issue #191) ─────────────────────────────────────────
+    //
+    // Scope: the pause only blocks `send`, the one entrypoint that moves
+    // funds. Admin rotation, upgrades, guardian management and recovery all
+    // keep working while paused, so a pause can never lock the owners out of
+    // fixing the incident (or recovering a compromised admin key).
+    //
+    // Roles: the pauser (a hot incident-response key) and the admin can both
+    // pause. Only the admin can unpause — when the admin is a multisig account
+    // that is what makes unpausing a multisig decision. A leaked pauser key
+    // can at worst stop sends, never resume them or change anything else.
+
+    /// Admin: set (or clear, with `None`) the address allowed to pause sends.
+    pub fn set_pauser(env: Env, admin: Address, pauser: Option<Address>) -> Result<(), WalletError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        Self::bump_instance_ttl(&env);
+        match &pauser {
+            Some(p) => env.storage().instance().set(&DataKey::Pauser, p),
+            None => env.storage().instance().remove(&DataKey::Pauser),
+        }
+        env.events()
+            .publish((Symbol::new(&env, "pauser_set"),), (admin, pauser));
+        Ok(())
+    }
+
+    /// The address currently allowed to pause sends, if any.
+    pub fn pauser(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Pauser)
+    }
+
+    /// Pauser or admin: stop `send` until the admin unpauses. Idempotent —
+    /// pausing an already-paused contract succeeds without a second event.
+    ///
+    /// # Errors
+    /// * [`WalletError::Unauthorized`] if `caller` is neither pauser nor admin.
+    pub fn pause_sends(env: Env, caller: Address) -> Result<(), WalletError> {
+        caller.require_auth();
+        let is_pauser = Self::pauser(env.clone()).map_or(false, |p| p == caller);
+        if !is_pauser {
+            Self::require_admin(&env, &caller)?;
+        }
+        if Self::is_send_paused(env.clone()) {
+            return Ok(());
+        }
+        Self::bump_instance_ttl(&env);
+        env.storage().instance().set(&DataKey::SendsPaused, &true);
+        env.events().publish(
+            (Symbol::new(&env, "sends_paused"),),
+            (caller, env.ledger().sequence()),
+        );
+        Ok(())
+    }
+
+    /// Admin only: resume `send`. Idempotent like [`Self::pause_sends`].
+    ///
+    /// # Errors
+    /// * [`WalletError::Unauthorized`] for anyone but the admin — including the pauser.
+    pub fn unpause_sends(env: Env, admin: Address) -> Result<(), WalletError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        if !Self::is_send_paused(env.clone()) {
+            return Ok(());
+        }
+        Self::bump_instance_ttl(&env);
+        env.storage().instance().remove(&DataKey::SendsPaused);
+        env.events().publish(
+            (Symbol::new(&env, "sends_unpaused"),),
+            (admin, env.ledger().sequence()),
+        );
+        Ok(())
+    }
+
+    /// Whether `send` is currently paused. Read by the backend status flag.
+    pub fn is_send_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::SendsPaused)
+            .unwrap_or(false)
     }
 
     // ── Migration ───────────────────────────────────────────────────────────────
@@ -3994,6 +4081,149 @@ mod tests {
             client.try_send(&user, &token_id, &code, &to, &100),
             Err(Ok(WalletError::TokenNotAllowed))
         );
+    }
+
+    // ── Emergency pause (issue #191) ─────────────────────────────────────────
+
+    /// Wiring with an allowlisted, funded, approved token ready for `send`.
+    fn setup_pausable_send() -> (
+        Env,
+        Address,
+        GlobeWalletClient<'static>,
+        Address,
+        Address,
+        Address,
+        String,
+        soroban_sdk::token::Client<'static>,
+    ) {
+        let (env, wallet_id, admin, client, wrapper_client) = setup_wiring();
+        let token_admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let code = String::from_str(&env, "XLM");
+        let (token_id, token_admin_client, token) = create_real_token(&env, &token_admin);
+        token_admin_client.mint(&user, &1_000);
+        client.add_allowed_token(&admin, &token_id);
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+        wrapper_client.approve(&user, &wallet_id, &1_000, &10_000);
+        (env, admin, client, user, token_id, Address::generate(&env), code, token)
+    }
+
+    #[test]
+    fn test_pauser_can_pause_and_send_fails_without_moving_tokens() {
+        let (env, admin, client, user, token_id, to, code, token) = setup_pausable_send();
+        let pauser = Address::generate(&env);
+        client.set_pauser(&admin, &Some(pauser.clone()));
+        assert_eq!(client.pauser(), Some(pauser.clone()));
+        assert!(!client.is_send_paused());
+
+        client.pause_sends(&pauser);
+        assert!(client.is_send_paused());
+        assert!(find_event(&env, "sends_paused").is_some());
+
+        assert_eq!(
+            client.try_send(&user, &token_id, &code, &to, &100),
+            Err(Ok(WalletError::SendsPaused))
+        );
+        assert_eq!(token.balance(&user), 1_000);
+        assert_eq!(token.balance(&to), 0);
+        assert_eq!(client.get_spent_today(&user, &code), 0);
+    }
+
+    #[test]
+    fn test_admin_can_pause_without_a_pauser() {
+        let (_env, admin, client, ..) = setup_pausable_send();
+        client.pause_sends(&admin);
+        assert!(client.is_send_paused());
+    }
+
+    #[test]
+    fn test_stranger_cannot_pause() {
+        let (env, admin, client, ..) = setup_pausable_send();
+        client.set_pauser(&admin, &Some(Address::generate(&env)));
+        let stranger = Address::generate(&env);
+        assert_eq!(client.try_pause_sends(&stranger), Err(Ok(WalletError::Unauthorized)));
+        assert!(!client.is_send_paused());
+    }
+
+    #[test]
+    fn test_pauser_cannot_unpause_but_admin_can() {
+        let (env, admin, client, user, token_id, to, code, token) = setup_pausable_send();
+        let pauser = Address::generate(&env);
+        client.set_pauser(&admin, &Some(pauser.clone()));
+        client.pause_sends(&pauser);
+
+        assert_eq!(client.try_unpause_sends(&pauser), Err(Ok(WalletError::Unauthorized)));
+        assert!(client.is_send_paused());
+
+        client.unpause_sends(&admin);
+        assert!(!client.is_send_paused());
+        assert!(find_event(&env, "sends_unpaused").is_some());
+
+        client.send(&user, &token_id, &code, &to, &100);
+        assert_eq!(token.balance(&to), 100);
+    }
+
+    #[test]
+    fn test_only_admin_can_set_pauser() {
+        let (env, _admin, client, ..) = setup_pausable_send();
+        let stranger = Address::generate(&env);
+        assert_eq!(
+            client.try_set_pauser(&stranger, &Some(stranger.clone())),
+            Err(Ok(WalletError::Unauthorized))
+        );
+        assert_eq!(client.pauser(), None);
+    }
+
+    #[test]
+    fn test_cleared_pauser_can_no_longer_pause() {
+        let (env, admin, client, ..) = setup_pausable_send();
+        let pauser = Address::generate(&env);
+        client.set_pauser(&admin, &Some(pauser.clone()));
+        client.set_pauser(&admin, &None);
+        assert_eq!(client.try_pause_sends(&pauser), Err(Ok(WalletError::Unauthorized)));
+    }
+
+    #[test]
+    fn test_pause_and_unpause_are_idempotent() {
+        let (_env, admin, client, ..) = setup_pausable_send();
+        client.unpause_sends(&admin); // not paused: no-op
+        client.pause_sends(&admin);
+        client.pause_sends(&admin); // already paused: no-op
+        assert!(client.is_send_paused());
+        client.unpause_sends(&admin);
+        assert!(!client.is_send_paused());
+    }
+
+    #[test]
+    fn test_recovery_still_works_while_sends_paused() {
+        let (env, admin, guardians, client) = setup_with_guardians(3);
+        client.set_recovery_config(&admin, &2u32, &GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS);
+        client.pause_sends(&admin);
+
+        let new_admin = Address::generate(&env);
+        client.initiate_recovery(&guardians.get(0).unwrap(), &new_admin);
+        client.approve_recovery(&guardians.get(1).unwrap());
+        let ready_at = client.recovery_proposal().unwrap().ready_at.unwrap();
+        env.ledger().with_mut(|l| l.sequence_number = ready_at);
+        client.execute_recovery();
+
+        assert_eq!(client.admin(), new_admin);
+        // The pause survives recovery, and the recovered admin can lift it.
+        assert!(client.is_send_paused());
+        assert_eq!(client.try_unpause_sends(&admin), Err(Ok(WalletError::Unauthorized)));
+        client.unpause_sends(&new_admin);
+        assert!(!client.is_send_paused());
+    }
+
+    #[test]
+    fn test_admin_changes_still_work_while_sends_paused() {
+        let (env, admin, client, ..) = setup_pausable_send();
+        client.pause_sends(&admin);
+        let candidate = Address::generate(&env);
+        client.propose_admin(&admin, &candidate);
+        client.accept_admin(&candidate);
+        assert_eq!(client.admin(), candidate);
+        assert!(client.is_send_paused());
     }
 
     #[test]

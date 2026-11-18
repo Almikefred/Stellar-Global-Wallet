@@ -25,6 +25,7 @@ import { createPreferencesRouter } from "./routes/preferences";
 import { localeMiddleware } from "./middleware/locale";
 import { errorHandler } from "./middleware/errorHandler";
 import { config } from "./config";
+import { renderMetrics } from "./services/metrics";
 import { StellarService } from "./services/stellar";
 import { SorobanService } from "./services/soroban";
 import { GlobeWalletContract } from "./services/contracts/globeWallet";
@@ -389,6 +390,12 @@ export function createApp(
     } catch (err) {
       next(err);
     }
+  });
+
+  // #194/#197 — Prometheus text metrics: lock wait/contention, refused
+  // submissions, sponsored reserves. Counters only, no account data.
+  app.get("/api/v1/health/metrics", (_req, res) => {
+    res.type("text/plain; version=0.0.4").send(renderMetrics());
   });
 
   // Unversioned and unauthenticated: this is where a browser enforcing
