@@ -207,6 +207,10 @@ pub struct SendExecutedEvent {
     pub amount: i128,
 }
 
+/// Current storage layout version (issue #184). See
+/// `docs/design/storage-layout.md`.
+pub const STORAGE_LAYOUT_VERSION: u32 = 2;
+
 /// `DailySpent` used to live in *temporary* storage while `SpendLimit` lives in
 /// *persistent* storage. Soroban archives temporary entries on its own TTL
 /// schedule, independent of the 86 400-second day-window logic here — if the
@@ -1048,38 +1052,39 @@ impl GlobeWallet {
 
     /// Return the current guardian set.
     pub fn guardians(env: Env) -> Vec<Address> {
+        if let Some(guardians) = env.storage().persistent().get(&DataKey::GuardianSet) {
+            return guardians;
+        }
+        // Legacy (v1) layout: not yet migrated.
         env.storage()
             .instance()
             .get(&DataKey::Guardians)
             .unwrap_or_else(|| Vec::new(&env))
     }
 
-    /// Return the guardian membership index. The ordered `Guardians` vector
-    /// remains the public API for enumeration; this map serves recovery-path
-    /// membership checks and duplicate detection.
-    ///
-    /// Contracts upgraded from a version before this index was added only
-    /// have the vector. Build and persist the index once on first access so
-    /// their registered guardians remain authorized after an upgrade.
-    fn guardian_membership(env: Env) -> Map<Address, bool> {
-        if let Some(membership) = env
-            .storage()
-            .instance()
-            .get(&DataKey::GuardianMembership)
-        {
-            return membership;
-        }
-
-        let guardians = Self::guardians(env.clone());
-        let mut membership = Map::new(&env);
-        for i in 0..guardians.len() {
-            membership.set(guardians.get(i).unwrap(), true);
-        }
+    /// Storage layout version in effect (issue #184). `1` = legacy instance
+    /// layout, `2` = guardians/proposal in persistent storage.
+    pub fn storage_layout(env: Env) -> u32 {
         env.storage()
             .instance()
-            .set(&DataKey::GuardianMembership, &membership);
-        membership
+            .get(&DataKey::StorageLayout)
+            .unwrap_or(1)
     }
+
+    /// Admin-triggered migration from the v1 instance layout to v2
+    /// (issue #184). Moves `Guardians`/`GuardianMembership`/`RecoveryProposal`
+    /// out of instance storage into persistent keys. Returns `true` if it
+    /// migrated, `false` if the contract was already on v2. Every guardian or
+    /// recovery write also migrates lazily, so calling this is optional; it
+    /// exists so operators can shrink the instance footprint immediately
+    /// after upgrading instead of waiting for the next guardian write.
+    pub fn migrate_storage_layout(env: Env, admin: Address) -> Result<bool, WalletError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        Self::bump_instance_ttl(&env);
+        Ok(Self::ensure_storage_layout(&env))
+    }
+
 
     /// Configure (or reconfigure) the M-of-N recovery threshold and the
     /// post-quorum timelock delay. Admin-authorized.
@@ -1117,7 +1122,8 @@ impl GlobeWallet {
     ) -> Result<(), WalletError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
-        if env.storage().instance().has(&DataKey::RecoveryProposal) {
+        Self::ensure_storage_layout(&env);
+        if Self::recovery_proposal(env.clone()).is_some() {
             return Err(WalletError::RecoveryAlreadyPending);
         }
         let guardians = Self::guardians(env.clone());
@@ -1163,7 +1169,8 @@ impl GlobeWallet {
         guardian.require_auth();
         Self::require_guardian(&env, &guardian)?;
         Self::require_recovery_configured(&env)?;
-        if env.storage().instance().has(&DataKey::RecoveryProposal) {
+        Self::ensure_storage_layout(&env);
+        if Self::recovery_proposal(env.clone()).is_some() {
             return Err(WalletError::RecoveryAlreadyPending);
         }
         Self::bump_instance_ttl(&env);
@@ -1415,6 +1422,10 @@ impl GlobeWallet {
 
     /// Return the pending recovery proposal, if any.
     pub fn recovery_proposal(env: Env) -> Option<RecoveryProposal> {
+        if let Some(p) = env.storage().persistent().get(&DataKey::PendingRecovery) {
+            return Some(p);
+        }
+        // Legacy (v1) layout: not yet migrated.
         env.storage().instance().get(&DataKey::RecoveryProposal)
     }
 
@@ -2661,13 +2672,97 @@ impl GlobeWallet {
     }
 
     fn require_guardian(env: &Env, caller: &Address) -> Result<(), WalletError> {
-        if Self::guardian_membership(env.clone())
-            .get(caller.clone())
-            .unwrap_or(false)
-        {
+        if Self::is_guardian(env, caller) {
             return Ok(());
         }
         Err(WalletError::Unauthorized)
+    }
+
+    // ── Storage layout v2 helpers (issue #184) ───────────────────────────────
+
+    /// O(1) membership check: one small persistent entry per guardian on v2;
+    /// falls back to the legacy instance map/vector on an unmigrated v1
+    /// contract.
+    fn is_guardian(env: &Env, who: &Address) -> bool {
+        let key = DataKey::GuardianFlag(who.clone());
+        if env.storage().persistent().has(&key) {
+            return true;
+        }
+        if Self::storage_layout(env.clone()) >= STORAGE_LAYOUT_VERSION {
+            return false;
+        }
+        let legacy: Option<Map<Address, bool>> =
+            env.storage().instance().get(&DataKey::GuardianMembership);
+        if let Some(map) = legacy {
+            return map.get(who.clone()).unwrap_or(false);
+        }
+        Self::guardians(env.clone()).contains(who)
+    }
+
+    fn set_guardian_flag(env: &Env, who: &Address) {
+        let key = DataKey::GuardianFlag(who.clone());
+        env.storage().persistent().set(&key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+    }
+
+    fn store_guardians(env: &Env, guardians: &Vec<Address>) {
+        env.storage().persistent().set(&DataKey::GuardianSet, guardians);
+        env.storage().persistent().extend_ttl(
+            &DataKey::GuardianSet,
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+    }
+
+    fn store_proposal(env: &Env, proposal: &RecoveryProposal) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingRecovery, proposal);
+        env.storage().persistent().extend_ttl(
+            &DataKey::PendingRecovery,
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+    }
+
+    fn remove_proposal(env: &Env) {
+        env.storage().persistent().remove(&DataKey::PendingRecovery);
+        env.storage().instance().remove(&DataKey::RecoveryProposal);
+    }
+
+    /// Move v1 instance entries to their v2 persistent keys. Idempotent;
+    /// returns `true` only when it actually migrated. Semantics-preserving,
+    /// so it needs no extra authorization beyond the caller's own path.
+    fn ensure_storage_layout(env: &Env) -> bool {
+        if Self::storage_layout(env.clone()) >= STORAGE_LAYOUT_VERSION {
+            return false;
+        }
+        let instance = env.storage().instance();
+        let legacy_guardians: Option<Vec<Address>> = instance.get(&DataKey::Guardians);
+        let mut moved_guardians: u32 = 0;
+        if let Some(guardians) = legacy_guardians {
+            for g in guardians.iter() {
+                Self::set_guardian_flag(env, &g);
+            }
+            moved_guardians = guardians.len();
+            Self::store_guardians(env, &guardians);
+        }
+        let legacy_proposal: Option<RecoveryProposal> = instance.get(&DataKey::RecoveryProposal);
+        let moved_proposal = legacy_proposal.is_some();
+        if let Some(p) = legacy_proposal {
+            Self::store_proposal(env, &p);
+        }
+        instance.remove(&DataKey::Guardians);
+        instance.remove(&DataKey::GuardianMembership);
+        instance.remove(&DataKey::RecoveryProposal);
+        instance.set(&DataKey::StorageLayout, &STORAGE_LAYOUT_VERSION);
+        env.events().publish(
+            (Symbol::new(env, "storage_migrated"),),
+            (STORAGE_LAYOUT_VERSION, moved_guardians, moved_proposal),
+        );
+        true
     }
 
     fn require_recovery_configured(env: &Env) -> Result<RecoveryConfig, WalletError> {
