@@ -35,6 +35,9 @@ Every state mutation in `GlobeWallet` emits at least one event with sufficient c
 | `add_allowed_token(admin, token_id)` | `"token_allowed"` | `("token_allowed",)` | `token_id: Address` | Adds token to allowlist for wrapped transfers. |
 | `remove_allowed_token(admin, token_id)` | `"token_disallowed"` | `("token_disallowed",)` | `token_id: Address` | Removes token from allowlist. |
 | `send(user, token_id, asset_code, to, amount)` | `"send_executed"` | `("send_executed",)` | `(user: Address, token_id: Address, to: Address, amount: i128)` | Emitted when token transfer through wrapper succeeds. |
+| `set_pauser(admin, pauser)` | `"pauser_set"` | `("pauser_set",)` | `(admin: Address, pauser: Option<Address>)` | Admin sets or clears the emergency pauser (#191). |
+| `pause_sends(caller)` | `"sends_paused"` | `("sends_paused",)` | `(caller: Address, ledger: u32)` | Pauser or admin stops `send`. Not emitted when already paused. |
+| `unpause_sends(admin)` | `"sends_unpaused"` | `("sends_unpaused",)` | `(admin: Address, ledger: u32)` | Admin resumes `send`. Not emitted when not paused. |
 | `migrate_user_assets(admin, user)` | `"user_assets_migrated"` | `("user_assets_migrated",)` | `(user: Address, removed: u32)` | Trims user asset list to MAX_ASSETS if exceeded. |
 | `extend_user_ttl(user)` | `"user_ttl_extended"` | `("user_ttl_extended",)` | `(user: Address, extended: u32)` | Permissionless keeper call extended the TTL of `extended` per-user entries (#185). |
 | token-wrapper `extend_allowance_ttl(owner, spender)` | `"allowance_ttl_extended"` | `("allowance_ttl_extended",)` | `(owner: Address, spender: Address, extend_to: u32)` | Keeper re-extended an allowance's TTL up to its `expiry_ledger` (#185). |

@@ -95,7 +95,24 @@ get_assets(env, user) -> Vec<AssetInfo>
 set_spend_limit(env, user, asset_code, limit: i128) -> Result<()>
 get_spend_limit(env, user, asset_code) -> i128
 record_spend(env, user, asset_code, amount) -> Result<()>
+
+// Emergency pause (#191)
+set_pauser(env, admin, pauser: Option<Address>) -> Result<()>  // admin only
+pauser(env) -> Option<Address>
+pause_sends(env, caller) -> Result<()>     // pauser or admin
+unpause_sends(env, admin) -> Result<()>    // admin only (use a multisig admin)
+is_send_paused(env) -> bool
 ```
+
+### Emergency pause
+
+`pause_sends` blocks `send` with `SendsPaused` (1039). Nothing else is paused:
+admin rotation, upgrades, guardian management and social recovery keep
+working, so a pause never locks the owners out of handling the incident. The
+pauser can be a hot incident-response key, because it can only stop sends. It
+cannot unpause or change anything else. Only the admin can unpause, so if the
+admin is a multisig account, unpausing needs the multisig. The backend reports
+the flag at `GET /api/v1/contract/status` (`sendsPaused`).
 
 ### Spend Limit Logic
 

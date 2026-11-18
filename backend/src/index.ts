@@ -1,7 +1,8 @@
 import "dotenv/config";
 import { config } from "./config";
 import { createApp } from "./app";
-import { ensureAuditTable } from "./db";
+import { ensureAuditTable, pool } from "./db";
+import { BuiltTransactionRegistry, PgBuiltTransactionStore } from "./services/builtTransactions";
 import { StellarService } from "./services/stellar";
 import { createAccountLock } from "./services/locks/createAccountLock";
 import { startPaymentNotifier } from "./services/paymentNotifier";
@@ -16,7 +17,9 @@ async function main() {
   getVerifiedAssets();
 
   const { lock, shutdown } = await createAccountLock();
-  const stellar = new StellarService(lock);
+  // #194 — /wallet/submit only relays envelopes built by this API.
+  const builtTxs = new BuiltTransactionRegistry(new PgBuiltTransactionStore(pool), config.NETWORK_PASSPHRASE);
+  const stellar = new StellarService(lock, builtTxs);
   const app = createApp(stellar);
 
   await ensureAuditTable();

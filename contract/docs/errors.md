@@ -62,7 +62,7 @@ flowchart LR
 | 1036 | `TokenTransferFailed` | `TOKEN_TRANSFER_FAILED` | The token transfer failed. Please check allowance and account balance. | Ensure adequate token balance and an active token allowance (`approve`). |
 | 1037 | `UpgradeDelayTooShort` | `UPGRADE_DELAY_TOO_SHORT` | The proposed upgrade timelock delay is below the minimum required ledgers. | Upgrade delay must be at least 17,280 ledgers (~24 hours). |
 | 1038 | `RecoveryDelayTooShort` | `RECOVERY_DELAY_TOO_SHORT` | The recovery timelock delay is below the minimum required ledgers. | Recovery delay must be at least 17,280 ledgers (~24 hours). |
-| 1039 | `SpendLimitArchived` | `SPEND_LIMIT_ARCHIVED` | Your spend limit for this asset needs to be restored before you can spend it. | The user opted into a limit but the `SpendLimit` entry is archived/missing. Fails closed instead of treating the asset as unlimited (#185). The backend restores the footprint automatically on the next prepared transaction. |
+| 1039 | `SendsPaused` | `SENDS_PAUSED` | Sending is temporarily paused while an incident is handled. | Wait for the admin to call `unpause_sends`. Recovery and admin changes still work. |
 
 ## Synchronization Guarantee
 

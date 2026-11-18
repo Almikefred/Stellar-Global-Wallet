@@ -175,7 +175,8 @@ export const WalletError = {
    * `set_recovery_config`'s `delay_in_ledgers` is below
    * [`GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS`] (see issue #84).
    */
-  1038: {message:"RecoveryDelayTooShort"}
+  1038: {message:"RecoveryDelayTooShort"},
+  1039: {message:"SendsPaused"}
 }
 
 
