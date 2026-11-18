@@ -13,8 +13,11 @@
 //!
 //! ## Spend Limits
 //! Each user can set a `spend_limit` (in stroops/smallest unit) per asset.
-//! Payments that would exceed the daily limit are rejected with `SpendLimitExceeded`.
-//! Limits reset automatically on ledger-time day boundary.
+//! Payments that would push the total spent in the trailing 24 hours over
+//! the limit are rejected with `SpendLimitExceeded`. The window rolls (it is
+//! not reset at 00:00 UTC), so the limit cannot be spent twice around
+//! midnight (issue #177). Spends are recorded whether or not a limit is set
+//! (issue #179), and migrations never delete limits (issue #178).
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Map, String, Symbol,
@@ -57,6 +60,10 @@ pub enum DataKey {
     AllowedToken(Address),
     /// Admin-curated list of all allowed token contract addresses.
     AllowedTokens,
+    /// Rolling 24 h spend window: (user, asset_code) → [`SpendWindow`]
+    /// (issue #177). Replaces the fixed-day `DailySpent` record, which is
+    /// only read now to carry a pre-upgrade spend forward.
+    SpendWindow(Address, String),
 }
 
 /// `DailySpent` used to live in *temporary* storage while `SpendLimit` lives in
@@ -70,9 +77,16 @@ pub enum DataKey {
 const LEDGERS_PER_DAY: u32 = 17_280; // ~86_400s / 5s average ledger close time
 const DAILY_SPENT_TTL_THRESHOLD: u32 = LEDGERS_PER_DAY;
 const DAILY_SPENT_TTL_EXTEND_TO: u32 = LEDGERS_PER_DAY * 2;
-/// Length of the `record_spend` day window. Windows are aligned to Unix
-/// time, so each one starts at 00:00:00 UTC by ledger close time.
+/// Length of the legacy fixed `DailySpent` day bucket (pre-#177).
 const SECONDS_PER_DAY: u64 = 86_400;
+/// Granularity of the rolling spend window (issue #177).
+const SPEND_BUCKET_SECONDS: u64 = 3_600;
+/// Number of hourly buckets kept per (user, asset): 24 for the window plus
+/// one guard bucket. Counting 25 buckets means every spend from the last
+/// 86 400 s is always counted (a spend can only be dropped once it is more
+/// than 24 h old), so in *any* 24 h interval the total spent is ≤ the limit.
+/// The cost is that a spend may stay counted for up to 25 h.
+const SPEND_WINDOW_BUCKETS: u32 = 25;
 
 /// `UserAssets` and `SpendLimit` are persistent entries without a natural
 /// time-based expiry (unlike `DailySpent`'s 86 400-second day window).
@@ -112,29 +126,44 @@ pub struct SpendRecord {
     pub day: u64,
 }
 
-/// Read-only view of a user's daily spend window for one asset, returned by
-/// [`GlobeWallet::get_spend_allowance`] (issue #50).
+/// Rolling spend window for one (user, asset) pair (issue #177).
 ///
-/// The window is the same 86 400-second bucket `record_spend` uses:
-/// `day = ledger_timestamp / 86400`. Ledger timestamps are Unix seconds, so
-/// windows start and end exactly at 00:00:00 UTC *as measured by ledger
-/// close time*, not wall-clock time on any client or server.
+/// O(1) storage: a fixed ring of [`SPEND_WINDOW_BUCKETS`] hourly totals.
+/// Slot `h % SPEND_WINDOW_BUCKETS` holds the amount spent during hour `h`
+/// (`h = ledger_timestamp / 3600`). Buckets older than
+/// `head_hour - (SPEND_WINDOW_BUCKETS - 1)` are zeroed as the head moves.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpendWindow {
+    /// Hour index of the newest bucket this ring has been advanced to.
+    pub head_hour: u64,
+    /// Exactly `SPEND_WINDOW_BUCKETS` per-hour totals.
+    pub buckets: Vec<i128>,
+}
+
+/// Read-only view of a user's rolling 24 h spend window for one asset,
+/// returned by [`GlobeWallet::get_spend_allowance`] (issues #50, #177).
+///
+/// Times are ledger timestamps (Unix seconds, by ledger close time).
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct SpendAllowance {
     /// Configured daily cap (0 = unlimited).
     pub limit: i128,
-    /// Amount recorded in the current window. Always 0 when `limit == 0`,
-    /// because `record_spend` does not track spends for unlimited assets.
+    /// Amount spent in the rolling window. Tracked even when `limit == 0`
+    /// (issue #179), so turning a limit on later accounts for it.
     pub spent: i128,
     /// `limit - spent`, floored at 0. 0 when `limit == 0` — callers must
     /// check `limit` to distinguish "unlimited" from "nothing left".
     pub remaining: i128,
-    /// Ledger timestamp (Unix seconds) at which the current window began.
+    /// Start of the oldest hourly bucket still counted in `spent`.
     pub window_start: u64,
-    /// Ledger timestamp (Unix seconds) at which the next window begins and
-    /// `spent` resets to 0.
+    /// When every spend currently counted will have rolled off (`spent`
+    /// reaches 0 if nothing else is spent). Equals "now" when `spent == 0`.
     pub window_resets_at: u64,
+    /// When the oldest counted bucket rolls off and `remaining` next grows.
+    /// 0 when nothing is counted.
+    pub next_refill_at: u64,
 }
 
 #[contracttype]
@@ -1197,7 +1226,7 @@ impl GlobeWallet {
 
     // ── Spend Limits ──────────────────────────────────────────────────────────
 
-    /// Set a daily spend limit (in stroops) for a specific asset.
+    /// Set a rolling 24 h spend limit (in stroops) for a specific asset.
     ///
     /// `limit = 0` removes the limit (unlimited).
     ///
@@ -1221,19 +1250,18 @@ impl GlobeWallet {
         if limit < 0 {
             return Err(WalletError::InvalidSpendLimit);
         }
-        // Retroactive check: reject if today's spend already exceeds the
-        // new limit (unless the new limit is 0 = unlimited).
+        // Retroactive check: reject if the rolling-window spend already
+        // exceeds the new limit (unless the new limit is 0 = unlimited).
+        // Spends are tracked even while no limit is set (issue #179), so a
+        // limit enabled after a large spend sees that spend here.
         if limit != 0 {
-            let now = env.ledger().timestamp();
-            let day = now / 86400;
-            let key = DataKey::DailySpent(user.clone(), asset_code.clone());
-            let record: SpendRecord = env
-                .storage()
-                .persistent()
-                .get(&key)
-                .unwrap_or(SpendRecord { amount: 0, day });
-            let spent_today = if record.day == day { record.amount } else { 0 };
-            if spent_today > limit {
+            let window = Self::load_spend_window(
+                &env,
+                &user,
+                &asset_code,
+                env.ledger().timestamp(),
+            );
+            if Self::window_total(&window) > limit {
                 return Err(WalletError::SpendLimitExceeded);
             }
         }
@@ -1262,54 +1290,134 @@ impl GlobeWallet {
             .unwrap_or(0)
     }
 
-    /// Amount spent by `user` in `asset_code` during the current day window
-    /// (issue #50). Mirrors `record_spend`'s window logic exactly: a stored
-    /// record from an earlier `day` bucket counts as 0.
+    /// Amount spent by `user` in `asset_code` in the rolling 24 h window
+    /// (issues #50, #177). Name kept for API compatibility.
     pub fn get_spent_today(env: Env, user: Address, asset_code: String) -> i128 {
-        let day = env.ledger().timestamp() / SECONDS_PER_DAY;
-        Self::spent_in_day(&env, &user, &asset_code, day)
+        let window = Self::load_spend_window(&env, &user, &asset_code, env.ledger().timestamp());
+        Self::window_total(&window)
     }
 
-    /// Limit, spent and remaining amounts for the current day window, plus
-    /// the ledger timestamps bounding it (issue #50). Read-only; intended to
+    /// Limit, spent and remaining amounts for the rolling window, plus when
+    /// the allowance next refills (issues #50, #177). Read-only; intended to
     /// be simulated rather than submitted.
     pub fn get_spend_allowance(env: Env, user: Address, asset_code: String) -> SpendAllowance {
         let now = env.ledger().timestamp();
-        let day = now / SECONDS_PER_DAY;
         let limit = Self::get_spend_limit(env.clone(), user.clone(), asset_code.clone());
-        let spent = Self::spent_in_day(&env, &user, &asset_code, day);
+        let window = Self::load_spend_window(&env, &user, &asset_code, now);
+        let spent = Self::window_total(&window);
         let remaining = if limit == 0 {
             0
         } else {
             (limit - spent).max(0)
         };
-        let window_start = day * SECONDS_PER_DAY;
+        let first_hour = Self::window_first_hour(window.head_hour);
+        let mut oldest: Option<u64> = None;
+        let mut newest: Option<u64> = None;
+        let mut h = first_hour;
+        while h <= window.head_hour {
+            if window.buckets.get(Self::spend_slot(h)).unwrap_or(0) != 0 {
+                if oldest.is_none() {
+                    oldest = Some(h);
+                }
+                newest = Some(h);
+            }
+            h += 1;
+        }
+        let expiry = |hour: u64| (hour + SPEND_WINDOW_BUCKETS as u64) * SPEND_BUCKET_SECONDS;
         SpendAllowance {
             limit,
             spent,
             remaining,
-            window_start,
-            window_resets_at: window_start + SECONDS_PER_DAY,
+            window_start: first_hour * SPEND_BUCKET_SECONDS,
+            window_resets_at: newest.map(expiry).unwrap_or(now),
+            next_refill_at: oldest.map(expiry).unwrap_or(0),
         }
     }
 
-    fn spent_in_day(env: &Env, user: &Address, asset_code: &String, day: u64) -> i128 {
-        let record: Option<SpendRecord> = env
+    fn spend_slot(hour: u64) -> u32 {
+        (hour % SPEND_WINDOW_BUCKETS as u64) as u32
+    }
+
+    fn window_first_hour(head_hour: u64) -> u64 {
+        head_hour.saturating_sub(SPEND_WINDOW_BUCKETS as u64 - 1)
+    }
+
+    fn window_total(window: &SpendWindow) -> i128 {
+        let mut total: i128 = 0;
+        for v in window.buckets.iter() {
+            total = total.saturating_add(v);
+        }
+        total
+    }
+
+    /// Load the (user, asset) window and advance it to `now` in memory.
+    /// Never writes: views use it too.
+    ///
+    /// When no window exists yet but a legacy fixed-day `DailySpent` record
+    /// does (pre-#177 data), its amount is placed in the current hour's
+    /// bucket if any of that day could still fall inside the last 24 h. That
+    /// over-counts (the amount stays counted for up to 25 h from now) but
+    /// never under-counts across the upgrade.
+    fn load_spend_window(env: &Env, user: &Address, asset_code: &String, now: u64) -> SpendWindow {
+        let hour = now / SPEND_BUCKET_SECONDS;
+        let stored: Option<SpendWindow> = env
             .storage()
             .persistent()
-            .get(&DataKey::DailySpent(user.clone(), asset_code.clone()));
-        match record {
-            Some(r) if r.day == day => r.amount,
-            _ => 0,
-        }
+            .get(&DataKey::SpendWindow(user.clone(), asset_code.clone()));
+        let mut window = match stored {
+            Some(w) if w.buckets.len() == SPEND_WINDOW_BUCKETS => w,
+            _ => {
+                let mut buckets: Vec<i128> = Vec::new(env);
+                for _ in 0..SPEND_WINDOW_BUCKETS {
+                    buckets.push_back(0);
+                }
+                let mut w = SpendWindow { head_hour: hour, buckets };
+                let legacy: Option<SpendRecord> = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::DailySpent(user.clone(), asset_code.clone()));
+                if let Some(r) = legacy {
+                    let legacy_end = r.day.saturating_add(1).saturating_mul(SECONDS_PER_DAY);
+                    if r.amount > 0 && legacy_end.saturating_add(SECONDS_PER_DAY) > now {
+                        w.buckets.set(Self::spend_slot(hour), r.amount);
+                    }
+                }
+                w
+            }
+        };
+        Self::advance_spend_window(&mut window, hour);
+        window
     }
 
-    /// Record a spend and reject if it would exceed the daily limit.
+    /// Zero every bucket that has fallen out of the window by `hour`.
+    fn advance_spend_window(window: &mut SpendWindow, hour: u64) {
+        if hour <= window.head_hour {
+            return;
+        }
+        let gap = hour - window.head_hour;
+        if gap >= SPEND_WINDOW_BUCKETS as u64 {
+            for i in 0..SPEND_WINDOW_BUCKETS {
+                window.buckets.set(i, 0);
+            }
+        } else {
+            let mut h = window.head_hour + 1;
+            while h <= hour {
+                window.buckets.set(Self::spend_slot(h), 0);
+                h += 1;
+            }
+        }
+        window.head_hour = hour;
+    }
+
+    /// Record a spend and reject if it would exceed the rolling 24 h limit.
     ///
-    /// Call this from any payment-execution path to enforce limits.
-    /// Day window is a 86 400-second bucket derived from ledger timestamp.
+    /// Call this from any payment-execution path to enforce limits. The
+    /// spend is recorded even when no limit is set (issue #179). The window
+    /// is the trailing 24 h (hourly buckets plus one guard bucket, see
+    /// [`SPEND_WINDOW_BUCKETS`]), so there is no midnight reset to exploit
+    /// (issue #177).
     ///
-    /// Reentrancy invariant: keep the interval from reading `DailySpent`
+    /// Reentrancy invariant: keep the interval from reading `SpendWindow`
     /// through writing its replacement free of external contract calls. See
     /// `docs/record-spend-reentrancy.md` for the proof and change guidance.
     ///
@@ -1351,33 +1459,35 @@ impl GlobeWallet {
         // `bump_instance_ttl`'s doc comment).
         Self::bump_instance_ttl(&env);
         let limit = Self::get_spend_limit(env.clone(), user.clone(), asset_code.clone());
-        if limit == 0 {
-            // No limit configured → always allow
-            return Ok(());
-        }
+        // Always record, limit or not (issue #179): a limit switched on
+        // later must see spends made while the asset was unlimited.
         let now = env.ledger().timestamp();
-        let day = now / 86400;
-        let key = DataKey::DailySpent(user.clone(), asset_code.clone());
-        let record: SpendRecord = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or(SpendRecord { amount: 0, day });
-        let spent_today = if record.day == day { record.amount } else { 0 };
-        let new_spent = spent_today
-            .checked_add(amount)
-            .ok_or(WalletError::SpendOverflow)?;
-        if new_spent > limit {
+        let mut window = Self::load_spend_window(&env, &user, &asset_code, now);
+        let spent = Self::window_total(&window);
+        let new_spent = match spent.checked_add(amount) {
+            Some(v) => v,
+            // Unlimited assets must never be blocked by bookkeeping.
+            None if limit == 0 => i128::MAX,
+            None => return Err(WalletError::SpendOverflow),
+        };
+        if limit != 0 && new_spent > limit {
             return Err(WalletError::SpendLimitExceeded);
         }
-        env.storage()
-            .persistent()
-            .set(&key, &SpendRecord { amount: new_spent, day });
+        let slot = Self::spend_slot(window.head_hour);
+        let bucket = window.buckets.get(slot).unwrap_or(0);
+        window.buckets.set(slot, bucket.saturating_add(amount));
+        let key = DataKey::SpendWindow(user.clone(), asset_code.clone());
+        env.storage().persistent().set(&key, &window);
         env.storage().persistent().extend_ttl(
             &key,
             DAILY_SPENT_TTL_THRESHOLD,
             DAILY_SPENT_TTL_EXTEND_TO,
         );
+        // The legacy record has been folded into the window; drop it.
+        let legacy_key = DataKey::DailySpent(user.clone(), asset_code.clone());
+        if env.storage().persistent().has(&legacy_key) {
+            env.storage().persistent().remove(&legacy_key);
+        }
         env.events().publish(
             (Symbol::new(&env, "spend_recorded"),),
             (user, asset_code, amount, new_spent, limit),
@@ -1602,6 +1712,11 @@ impl GlobeWallet {
     /// Admin and user: trim a user's asset list to [`GlobeWallet::MAX_ASSETS`] if it exceeds the bound.
     /// Returns the number of assets trimmed (0 if already within limit).
     ///
+    /// Only the display list is trimmed. Spend limits and spend windows of
+    /// trimmed assets are kept and keep being enforced (issue #178); one
+    /// `("migration", "asset_untracked")` event with `(user, code, limit)`
+    /// is emitted per trimmed asset.
+    ///
     /// # Authorization Decision
     /// Dual authorization is required: `admin.require_auth()` ensures only an
     /// administrator can initiate a migration, while `user.require_auth()`
@@ -1625,10 +1740,26 @@ impl GlobeWallet {
         for i in 0..Self::MAX_ASSETS {
             trimmed.push_back(assets.get(i).unwrap());
         }
+        // Issue #178: spend limits are keyed by (user, asset_code) and are
+        // independent of the display list. Trimming the list must never
+        // delete a limit or its spend window — a missing limit means
+        // "unlimited" and the token stays sendable. Every trimmed asset gets
+        // an event (with the limit that stays in force) so the backend can
+        // tell the user which assets left their list.
         for i in Self::MAX_ASSETS..len {
             let dropped = assets.get(i).unwrap();
-            env.storage().persistent().remove(&DataKey::SpendLimit(user.clone(), dropped.code.clone()));
-            env.storage().persistent().remove(&DataKey::DailySpent(user.clone(), dropped.code.clone()));
+            let limit = Self::get_spend_limit(env.clone(), user.clone(), dropped.code.clone());
+            if limit != 0 {
+                env.storage().persistent().extend_ttl(
+                    &DataKey::SpendLimit(user.clone(), dropped.code.clone()),
+                    PERSISTENT_TTL_THRESHOLD,
+                    PERSISTENT_TTL_EXTEND_TO,
+                );
+            }
+            env.events().publish(
+                (Symbol::new(&env, "migration"), Symbol::new(&env, "asset_untracked")),
+                (user.clone(), dropped.code.clone(), limit),
+            );
         }
         env.storage()
             .persistent()
@@ -2234,24 +2365,70 @@ mod tests {
         });
         let removed = client.migrate_user_assets(&admin, &user);
         assert_eq!(removed, 10);
+        let migration_events = env
+            .events()
+            .all()
+            .iter()
+            .filter(|(_, topics, _)| {
+                topics
+                    .first()
+                    .and_then(|t| Symbol::try_from_val(&env, &t).ok())
+                    .map(|s| s == Symbol::new(&env, "migration"))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(migration_events, 10, "one event per trimmed asset");
         let assets = client.get_assets(&user);
         assert_eq!(assets.len(), GlobeWallet::MAX_ASSETS as u32);
         
+
         env.as_contract(&cid, || {
-            // Verify that dropped assets' storage keys are removed
-            for i in GlobeWallet::MAX_ASSETS..GlobeWallet::MAX_ASSETS + 10 {
-                let code = String::from_str(&env, &std::format!("ASSET{}", i));
-                assert!(!env.storage().persistent().has(&DataKey::SpendLimit(user.clone(), code.clone())));
-                assert!(!env.storage().persistent().has(&DataKey::DailySpent(user.clone(), code.clone())));
-            }
-            
-            // Verify that kept assets' storage keys are intact
-            for i in 0..GlobeWallet::MAX_ASSETS {
+            // Issue #178: limits and spend records are kept for every asset,
+            // trimmed or not.
+            for i in 0..GlobeWallet::MAX_ASSETS + 10 {
                 let code = String::from_str(&env, &std::format!("ASSET{}", i));
                 assert!(env.storage().persistent().has(&DataKey::SpendLimit(user.clone(), code.clone())));
                 assert!(env.storage().persistent().has(&DataKey::DailySpent(user.clone(), code.clone())));
             }
         });
+
+        // Every previously limited token still enforces its limit.
+        for i in 0..GlobeWallet::MAX_ASSETS + 10 {
+            let code = String::from_str(&env, &std::format!("ASSET{}", i));
+            assert_eq!(client.get_spend_limit(&user, &code), 1000);
+            assert_eq!(
+                client.try_record_spend(&user, &code, &1001_i128),
+                Err(Ok(WalletError::SpendLimitExceeded))
+            );
+        }
+    }
+
+    #[test]
+    fn test_migrate_user_assets_keeps_spend_window_of_trimmed_asset() {
+        let (env, cid, admin, client) = setup();
+        let user = Address::generate(&env);
+        let mut assets: Vec<AssetInfo> = Vec::new(&env);
+        for i in 0..GlobeWallet::MAX_ASSETS + 1 {
+            let code = String::from_str(&env, &std::format!("ASSET{}", i));
+            assets.push_back(AssetInfo { code, issuer: None });
+        }
+        env.as_contract(&cid, || {
+            env.storage().persistent().set(&DataKey::UserAssets(user.clone()), &assets);
+        });
+        let trimmed = String::from_str(&env, &std::format!("ASSET{}", GlobeWallet::MAX_ASSETS));
+        client.set_spend_limit(&user, &trimmed, &1_000_i128);
+        client.record_spend(&user, &trimmed, &700_i128);
+
+        assert_eq!(client.migrate_user_assets(&admin, &user), 1);
+        assert!(!client.get_assets(&user).iter().any(|a| a.code == trimmed));
+
+        // Not reset to "unlimited" and the 700 already spent still counts.
+        assert_eq!(client.get_spend_limit(&user, &trimmed), 1_000);
+        assert_eq!(client.get_spent_today(&user, &trimmed), 700);
+        assert_eq!(
+            client.try_record_spend(&user, &trimmed, &301_i128),
+            Err(Ok(WalletError::SpendLimitExceeded))
+        );
     }
 
     #[test]
@@ -3233,148 +3410,313 @@ mod tests {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // record_spend day-boundary rigorous tests
+    // Rolling 24 h spend window (issue #177)
     //
-    // The contract uses:  day = env.ledger().timestamp() / 86_400
-    //
-    // Guarantee: two calls whose timestamps land in the SAME 86 400-second
-    // bucket accumulate into the same daily total.  Two calls whose timestamps
-    // land in DIFFERENT buckets each start fresh from zero.
-    //
-    // Boundary at N*86 400:
-    //   timestamp N*86_400 - 1  → bucket N-1
-    //   timestamp N*86_400      → bucket N   ← new day resets the counter
+    // Spends are counted in hourly buckets; 25 buckets (24 + 1 guard) are
+    // kept, so a spend stays counted for at least 24 h and at most 25 h.
+    // There is no midnight reset.
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Calls at the last second of a bucket (T = day*86400 - 1) accumulate.
-    #[test]
-    fn test_record_spend_boundary_last_second_of_day_accumulates() {
-        let (env, _cid, _admin, client) = setup();
-        let user = Address::generate(&env);
-        let code = String::from_str(&env, "XLM");
-        client.set_spend_limit(&user, &code, &1_000_i128);
+    const H: u64 = 3_600;
+    const DAY: u64 = 86_400;
 
-        // Set timestamp to the very last second of day 1 (day 0 bucket ends at 86399)
-        let day = 1u64;
-        let last_sec_of_day = day * 86_400 - 1; // 86_399 → still in bucket 0
-        env.ledger().with_mut(|l| l.timestamp = last_sec_of_day);
-
-        client.record_spend(&user, &code, &600_i128);
-
-        // Second call in the same bucket should accumulate
-        assert_eq!(
-            client.try_record_spend(&user, &code, &401_i128),
-            Err(Ok(WalletError::SpendLimitExceeded)),
-            "Two spends in the same bucket must accumulate: 600+401 > 1000"
-        );
+    fn set_time(env: &Env, ts: u64) {
+        env.ledger().with_mut(|l| l.timestamp = ts);
     }
 
-    /// Call at the first second of the next bucket (T = day*86400) resets to zero.
+    /// The exact attack from #177: full limit at 23:59 UTC, then again at
+    /// 00:00 UTC. The second spend must be rejected.
     #[test]
-    fn test_record_spend_boundary_first_second_of_new_day_resets() {
+    fn test_rolling_window_blocks_midnight_double_spend() {
         let (env, _cid, _admin, client) = setup();
         let user = Address::generate(&env);
         let code = String::from_str(&env, "XLM");
         client.set_spend_limit(&user, &code, &1_000_i128);
 
-        // Spend 900 in bucket 0
-        env.ledger().with_mut(|l| l.timestamp = 86_399); // bucket 0 = ts/86400 == 0
-        client.record_spend(&user, &code, &900_i128);
-
-        // Advance to the exact start of bucket 1 — counter must reset
-        env.ledger().with_mut(|l| l.timestamp = 86_400); // bucket 1 = ts/86400 == 1
-
-        // Should succeed because we're in a brand-new bucket
+        set_time(&env, 2 * DAY - 60);
         client.record_spend(&user, &code, &1_000_i128);
-    }
 
-    /// Explicit boundary: timestamp N*86400 - 1 vs N*86400 are different buckets.
-    #[test]
-    fn test_record_spend_exact_day_boundary() {
-        let (env, _cid, _admin, client) = setup();
-        let user = Address::generate(&env);
-        let code = String::from_str(&env, "XLM");
-        client.set_spend_limit(&user, &code, &500_i128);
-
-        let n: u64 = 5;
-        let before_boundary = n * 86_400 - 1; // bucket n-1
-        let at_boundary     = n * 86_400;     // bucket n
-
-        // Spend right at the boundary-minus-one
-        env.ledger().with_mut(|l| l.timestamp = before_boundary);
-        client.record_spend(&user, &code, &500_i128); // fills bucket n-1 exactly
-
-        // Any more spend in bucket n-1 must fail
+        set_time(&env, 2 * DAY);
         assert_eq!(
             client.try_record_spend(&user, &code, &1_i128),
             Err(Ok(WalletError::SpendLimitExceeded))
         );
 
-        // Crossing into bucket n resets the counter: full 500 must be available again
-        env.ledger().with_mut(|l| l.timestamp = at_boundary);
-        client.record_spend(&user, &code, &500_i128);
-    }
-
-    /// Validates that the bucket is derived from integer division (not rounding).
-    #[test]
-    fn test_record_spend_bucket_is_integer_division() {
-        let (env, _cid, _admin, client) = setup();
-        let user = Address::generate(&env);
-        let code = String::from_str(&env, "XLM");
-        client.set_spend_limit(&user, &code, &100_i128);
-
-        // All three timestamps below belong to bucket 1 (86400..=172799)
-        // Reset env per iteration by re-registering is expensive;
-        // instead use the fact that the day counter resets between buckets
-        // and just verify that within the same bucket they accumulate.
-
-        // Spend 50 in bucket 1
-        env.ledger().with_mut(|l| l.timestamp = 86_400);
-        client.record_spend(&user, &code, &50_i128);
-
-        // Move to middle of same bucket — still bucket 1, should accumulate
-        env.ledger().with_mut(|l| l.timestamp = 129_600); // 86400 + 43200
+        // Still blocked 23 h 59 m after the spend.
+        set_time(&env, 3 * DAY - 61);
         assert_eq!(
-            client.try_record_spend(&user, &code, &51_i128),
-            Err(Ok(WalletError::SpendLimitExceeded)),
-            "50+51 > 100: mid-bucket accumulation must hold"
+            client.try_record_spend(&user, &code, &1_i128),
+            Err(Ok(WalletError::SpendLimitExceeded))
         );
 
-        // Move to end of bucket 1
-        env.ledger().with_mut(|l| l.timestamp = 172_799);
-        assert_eq!(
-            client.try_record_spend(&user, &code, &51_i128),
-            Err(Ok(WalletError::SpendLimitExceeded)),
-            "50+51 > 100: end-of-bucket accumulation must hold"
-        );
+        // Fully available again once the spend's bucket has rolled off.
+        set_time(&env, 2 * DAY - 60 + DAY + H);
+        client.record_spend(&user, &code, &1_000_i128);
     }
 
-    /// Demonstrates the known skew risk: if validator timestamps drift up to
-    /// `MAX_CLOSE_TIME_DRIFT` (typically ±1 s on Stellar), a human's "same
-    /// second" could split across two buckets only if it straddles an exact
-    /// multiple of 86 400.  Probability is vanishingly small (1/86400 ≈ 0.001%)
-    /// but the test documents the invariant explicitly.
+    /// Spends roll off one bucket at a time, not all at once.
     #[test]
-    fn test_record_spend_boundary_drift_awareness() {
+    fn test_rolling_window_refills_partially() {
         let (env, _cid, _admin, client) = setup();
         let user = Address::generate(&env);
         let code = String::from_str(&env, "XLM");
         client.set_spend_limit(&user, &code, &1_000_i128);
 
-        // Two validator-derived timestamps 2 seconds apart straddling midnight
-        let just_before = 2 * 86_400 - 1;
-        let just_after  = 2 * 86_400;
+        let t0 = 10 * DAY;
+        set_time(&env, t0);
+        client.record_spend(&user, &code, &600_i128);
+        set_time(&env, t0 + 10 * H);
+        client.record_spend(&user, &code, &400_i128);
 
-        // Spend near-limit just before midnight
-        env.ledger().with_mut(|l| l.timestamp = just_before);
-        client.record_spend(&user, &code, &999_i128);
+        // 25 h after the first spend only its 600 is back.
+        set_time(&env, t0 + 25 * H);
+        assert_eq!(client.get_spent_today(&user, &code), 400);
+        assert_eq!(
+            client.try_record_spend(&user, &code, &601_i128),
+            Err(Ok(WalletError::SpendLimitExceeded))
+        );
+        client.record_spend(&user, &code, &600_i128);
+    }
 
-        // If a second tx arrives 1 second later it lands in a new bucket and is ALLOWED.
-        // This is the known fixed-bucket split: user perceives same-session but
-        // contract resets. Not exploitable (it's more restrictive by resetting), but
-        // confusing to users.
-        env.ledger().with_mut(|l| l.timestamp = just_after);
-        client.record_spend(&user, &code, &1_000_i128); // succeeds — new bucket
+    #[test]
+    fn test_spend_allowance_reports_rolling_window_and_next_refill() {
+        let (env, _cid, _admin, client) = setup();
+        let user = Address::generate(&env);
+        let code = String::from_str(&env, "XLM");
+        client.set_spend_limit(&user, &code, &1_000_i128);
+
+        let t0 = 5 * DAY + 30 * 60; // 00:30 UTC
+        set_time(&env, t0);
+        let empty = client.get_spend_allowance(&user, &code);
+        assert_eq!(empty.spent, 0);
+        assert_eq!(empty.remaining, 1_000);
+        assert_eq!(empty.next_refill_at, 0);
+        assert_eq!(empty.window_resets_at, t0);
+
+        client.record_spend(&user, &code, &300_i128);
+        set_time(&env, t0 + 2 * H);
+        client.record_spend(&user, &code, &200_i128);
+
+        let a = client.get_spend_allowance(&user, &code);
+        assert_eq!(a.limit, 1_000);
+        assert_eq!(a.spent, 500);
+        assert_eq!(a.remaining, 500);
+        let first_hour = t0 / H;
+        assert_eq!(a.next_refill_at, (first_hour + 25) * H);
+        assert_eq!(a.window_resets_at, (first_hour + 2 + 25) * H);
+        assert_eq!(a.window_start, (first_hour + 2 - 24) * H);
+
+        // At next_refill_at the first spend is gone.
+        set_time(&env, a.next_refill_at);
+        let b = client.get_spend_allowance(&user, &code);
+        assert_eq!(b.spent, 200);
+        assert_eq!(b.remaining, 800);
+    }
+
+    /// Small deterministic PRNG so the property test needs no extra crate.
+    struct XorShift(u64);
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+    }
+
+    /// Property (issue #177): over arbitrary spend sequences, the accepted
+    /// spends inside any 24 h interval never sum to more than the limit,
+    /// and the contract never under-counts the trailing 24 h.
+    #[test]
+    fn test_property_rolling_window_never_exceeds_limit_in_any_24h() {
+        for seed in 1..=12u64 {
+            let (env, _cid, _admin, client) = setup();
+            let user = Address::generate(&env);
+            let code = String::from_str(&env, "XLM");
+            let mut rng = XorShift(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let limit: i128 = 1_000 + (rng.next() % 9_000) as i128;
+            client.set_spend_limit(&user, &code, &limit);
+
+            let mut now: u64 = DAY * (1 + rng.next() % 30) + rng.next() % DAY;
+            let mut accepted: std::vec::Vec<(u64, i128)> = std::vec::Vec::new();
+            for _ in 0..60 {
+                // Mix tiny steps, ~hour steps and multi-hour jumps, plus
+                // steps that land right on bucket and day boundaries.
+                now += match rng.next() % 5 {
+                    0 => rng.next() % 60,
+                    1 => rng.next() % (2 * H),
+                    2 => rng.next() % (8 * H),
+                    3 => H - (now % H),
+                    _ => DAY - (now % DAY),
+                };
+                set_time(&env, now);
+                let amount: i128 = 1 + (rng.next() % (limit as u64)) as i128;
+                if client.try_record_spend(&user, &code, &amount).is_ok() {
+                    accepted.push((now, amount));
+                }
+
+                let exact: i128 = accepted
+                    .iter()
+                    .filter(|(t, _)| *t + DAY > now)
+                    .map(|(_, a)| *a)
+                    .sum();
+                assert!(exact <= limit, "seed {seed}: {exact} spent in 24 h > limit {limit}");
+                assert!(
+                    client.get_spent_today(&user, &code) >= exact,
+                    "seed {seed}: window under-counts the trailing 24 h"
+                );
+            }
+            // Every 24 h interval, not just those ending "now".
+            for (i, (ti, _)) in accepted.iter().enumerate() {
+                let sum: i128 = accepted[i..]
+                    .iter()
+                    .filter(|(t, _)| *t < *ti + DAY)
+                    .map(|(_, a)| *a)
+                    .sum();
+                assert!(sum <= limit, "seed {seed}: interval from {ti} sums to {sum} > {limit}");
+            }
+        }
+    }
+
+    /// Pre-#177 `DailySpent` data is carried into the new window instead of
+    /// being forgotten on upgrade.
+    #[test]
+    fn test_legacy_daily_spent_is_carried_into_rolling_window() {
+        let (env, cid, _admin, client) = setup();
+        let user = Address::generate(&env);
+        let code = String::from_str(&env, "XLM");
+        client.set_spend_limit(&user, &code, &1_000_i128);
+        let now = 7 * DAY + 5 * H;
+        set_time(&env, now);
+        env.as_contract(&cid, || {
+            env.storage().persistent().set(
+                &DataKey::DailySpent(user.clone(), code.clone()),
+                &SpendRecord { amount: 900, day: now / DAY },
+            );
+        });
+        assert_eq!(client.get_spent_today(&user, &code), 900);
+        assert_eq!(
+            client.try_record_spend(&user, &code, &101_i128),
+            Err(Ok(WalletError::SpendLimitExceeded))
+        );
+        client.record_spend(&user, &code, &100_i128);
+        env.as_contract(&cid, || {
+            assert!(!env.storage().persistent().has(&DataKey::DailySpent(user.clone(), code.clone())));
+            assert!(env.storage().persistent().has(&DataKey::SpendWindow(user.clone(), code.clone())));
+        });
+        assert_eq!(client.get_spent_today(&user, &code), 1_000);
+    }
+
+    #[test]
+    fn test_legacy_daily_spent_from_long_ago_is_ignored() {
+        let (env, cid, _admin, client) = setup();
+        let user = Address::generate(&env);
+        let code = String::from_str(&env, "XLM");
+        client.set_spend_limit(&user, &code, &1_000_i128);
+        let now = 7 * DAY + 5 * H;
+        set_time(&env, now);
+        env.as_contract(&cid, || {
+            env.storage().persistent().set(
+                &DataKey::DailySpent(user.clone(), code.clone()),
+                &SpendRecord { amount: 900, day: now / DAY - 3 },
+            );
+        });
+        assert_eq!(client.get_spent_today(&user, &code), 0);
+        client.record_spend(&user, &code, &1_000_i128);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Spend recorded regardless of limit (issue #179)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_spend_without_limit_is_still_recorded() {
+        let (env, _cid, _admin, client) = setup();
+        let user = Address::generate(&env);
+        let code = String::from_str(&env, "XLM");
+        client.record_spend(&user, &code, &10_000_i128);
+        assert!(find_event(&env, "spend_recorded").is_some());
+        assert_eq!(client.get_spent_today(&user, &code), 10_000);
+        let a = client.get_spend_allowance(&user, &code);
+        assert_eq!(a.limit, 0);
+        assert_eq!(a.spent, 10_000);
+    }
+
+    /// Send then set limit ⇒ remaining allowance reflects the earlier spend.
+    #[test]
+    fn test_send_then_set_limit_reflects_earlier_spend() {
+        let (env, _cid, _admin, client) = setup();
+        let user = Address::generate(&env);
+        let code = String::from_str(&env, "XLM");
+        client.record_spend(&user, &code, &400_i128);
+        client.set_spend_limit(&user, &code, &1_000_i128);
+        let a = client.get_spend_allowance(&user, &code);
+        assert_eq!(a.spent, 400);
+        assert_eq!(a.remaining, 600);
+        assert_eq!(
+            client.try_record_spend(&user, &code, &601_i128),
+            Err(Ok(WalletError::SpendLimitExceeded))
+        );
+        client.record_spend(&user, &code, &600_i128);
+    }
+
+    /// The #179 scenario: 10 000 sent unlimited, then a 1 000 limit. The
+    /// retroactive check now sees the 10 000, so the user cannot get a
+    /// fresh 1 000 on top of it.
+    #[test]
+    fn test_large_unlimited_spend_then_lower_limit_is_retroactive() {
+        let (env, _cid, _admin, client) = setup();
+        let user = Address::generate(&env);
+        let code = String::from_str(&env, "XLM");
+        set_time(&env, 3 * DAY);
+        client.record_spend(&user, &code, &10_000_i128);
+        assert_eq!(
+            client.try_set_spend_limit(&user, &code, &1_000_i128),
+            Err(Ok(WalletError::SpendLimitExceeded))
+        );
+        assert_eq!(client.get_spend_limit(&user, &code), 0);
+
+        // Once the spend rolls off, the limit can be set and is fully available.
+        set_time(&env, 3 * DAY + 25 * H);
+        client.set_spend_limit(&user, &code, &1_000_i128);
+        client.record_spend(&user, &code, &1_000_i128);
+        assert_eq!(
+            client.try_record_spend(&user, &code, &1_i128),
+            Err(Ok(WalletError::SpendLimitExceeded))
+        );
+    }
+
+    /// Order of operations no longer matters: set-then-spend and
+    /// spend-then-set leave the same remaining allowance.
+    #[test]
+    fn test_spend_limit_order_of_operations_is_consistent() {
+        let (env, _cid, _admin, client) = setup();
+        let code = String::from_str(&env, "XLM");
+        let a = Address::generate(&env);
+        let b = Address::generate(&env);
+
+        client.set_spend_limit(&a, &code, &1_000_i128);
+        client.record_spend(&a, &code, &250_i128);
+
+        client.record_spend(&b, &code, &250_i128);
+        client.set_spend_limit(&b, &code, &1_000_i128);
+
+        assert_eq!(
+            client.get_spend_allowance(&a, &code).remaining,
+            client.get_spend_allowance(&b, &code).remaining
+        );
+    }
+
+    #[test]
+    fn test_unlimited_spend_bookkeeping_never_overflows_into_an_error() {
+        let (env, _cid, _admin, client) = setup();
+        let user = Address::generate(&env);
+        let code = String::from_str(&env, "XLM");
+        client.record_spend(&user, &code, &i128::MAX);
+        client.record_spend(&user, &code, &i128::MAX);
+        assert_eq!(client.get_spent_today(&user, &code), i128::MAX);
     }
 
     #[test]
@@ -3700,14 +4042,14 @@ mod tests {
         // And the transaction-atomicity guarantee: since the whole call
         // failed, record_spend's own (legitimate) write inside `send` must
         // also have been rolled back — not just the reentrant one. There
-        // must be no DailySpent entry at all, proving neither the intended
+        // must be no SpendWindow entry at all, proving neither the intended
         // spend nor a reentrant double-spend was left committed.
         env.as_contract(&wallet_id, || {
-            let key = DataKey::DailySpent(user.clone(), code.clone());
-            let record: Option<SpendRecord> = env.storage().persistent().get(&key);
+            let key = DataKey::SpendWindow(user.clone(), code.clone());
+            let record: Option<SpendWindow> = env.storage().persistent().get(&key);
             assert!(
                 record.is_none(),
-                "no DailySpent entry should survive a fully-reverted transaction; found {:?}",
+                "no SpendWindow entry should survive a fully-reverted transaction; found {:?}",
                 record
             );
         });

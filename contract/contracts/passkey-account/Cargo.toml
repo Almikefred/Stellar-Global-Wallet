@@ -1,0 +1,20 @@
+[package]
+name = "passkey-account"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+# Test-only: produces real P-256 ECDSA signatures for WebAuthn test vectors.
+# Same version soroban-env-host 21.2.1 already pulls in for its own
+# secp256r1_verify, so it adds no new crate to the graph.
+p256 = { version = "0.13.2", default-features = false, features = ["ecdsa", "arithmetic"] }
+
+[features]
+testutils = ["soroban-sdk/testutils"]
