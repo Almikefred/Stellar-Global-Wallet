@@ -1,5 +1,5 @@
 use globe_wallet::{GlobeWallet, GlobeWalletClient, WalletError};
-use soroban_sdk::{contract, contractimpl, testutils::Address as _, Address, Env, String};
+use soroban_sdk::{contract, contractimpl, testutils::Address as _, Address, Env};
 
 #[contract]
 struct SameInvocationBatcher;
@@ -10,13 +10,13 @@ impl SameInvocationBatcher {
         env: Env,
         wallet: Address,
         user: Address,
-        asset_code: String,
+        token_id: Address,
         first: i128,
         second: i128,
     ) {
         let wallet = GlobeWalletClient::new(&env, &wallet);
-        wallet.record_spend(&user, &asset_code, &first);
-        wallet.record_spend(&user, &asset_code, &second);
+        wallet.record_spend(&user, &token_id, &first);
+        wallet.record_spend(&user, &token_id, &second);
     }
 }
 
@@ -30,22 +30,22 @@ fn two_spends_in_one_host_invocation_accumulate() {
     let batcher_id = env.register_contract(None, SameInvocationBatcher);
     let batcher = SameInvocationBatcherClient::new(&env, &batcher_id);
     let user = Address::generate(&env);
-    let asset_code = String::from_str(&env, "XLM");
+    let token_id = Address::generate(&env);
 
-    wallet.set_spend_limit(&user, &asset_code, &1_000_i128);
+    wallet.set_spend_limit(&user, &token_id, &1_000_i128);
 
     // Both calls share one root host invocation. The second call must observe
     // the first call's write rather than overwrite a stale zero value.
     batcher.record_twice(
         &wallet_id,
         &user,
-        &asset_code,
+        &token_id,
         &600_i128,
         &400_i128,
     );
 
     assert_eq!(
-        wallet.try_record_spend(&user, &asset_code, &1_i128),
+        wallet.try_record_spend(&user, &token_id, &1_i128),
         Err(Ok(WalletError::SpendLimitExceeded))
     );
 }
