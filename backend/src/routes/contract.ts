@@ -119,6 +119,16 @@ export function createContractRouter(globeWallet: GlobeWalletContract): Router {
     }
   });
 
+  // #191 — emergency pause status flag. Public: clients use it to explain
+  // why sends fail with SENDS_PAUSED and to hide the send action meanwhile.
+  contractRouter.get("/status", async (_req, res, next) => {
+    try {
+      res.json(await globeWallet.getContractStatus());
+    } catch (err) {
+      next(err);
+    }
+  });
+
   // #80 — Settings screen: read current admin and pending admin candidate (null-safe)
   contractRouter.get("/admin", async (_req, res, next) => {
     try {

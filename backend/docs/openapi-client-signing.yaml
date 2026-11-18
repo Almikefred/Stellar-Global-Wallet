@@ -187,6 +187,16 @@ paths:
         with `details.horizonResultCodes`.
 
 
+        Only transactions built by this API are relayed (#194). The inner
+        transaction hash must match one returned by a build endpoint
+        (`/wallet/send/build`, the path-payment builds, `/wallet/trustline/build`). An envelope with the same source and
+        sequence but different contents (an extra operation, another fee or
+        destination) is `INVALID_TRANSACTION` with reason `ENVELOPE_MODIFIED`
+        and `details.differences`. Any other unknown transaction is
+        `NOT_BUILT_BY_API`. Fee-bump wrappers around a built transaction are
+        accepted.
+
+
         Send an `Idempotency-Key` header or an `idempotencyKey` body field to
         make retries safe: a repeat with the same key from the same source
         account within 24 hours replays the first `{ hash, successful }`

@@ -123,7 +123,7 @@ service entirely), `sendPayment` no longer lets Horizon's raw
 { "error": "...explains what happened and that it's safe to retry...", "code": "SEQUENCE_CONFLICT", "retryable": true }
 ```
 
-A lock acquisition timeout (Redis backend only) maps to:
+A lock acquisition timeout (either backend) maps to:
 
 ```
 503 Service Unavailable
@@ -133,3 +133,34 @@ A lock acquisition timeout (Redis backend only) maps to:
 Both are `retryable: true` because in both cases this request's funds were
 not moved — the caller can safely retry rather than needing to manually
 reconcile against Horizon.
+
+## Unified lock semantics (issue #197)
+
+Both backends now extend one base class (`BaseAccountLock` in
+`accountLock.ts`) and only differ in where the lock table lives (a `Map`
+vs Redis). Tests pass in-memory and behave the same in production because
+the same contract suite (`tests/locks/accountLockContract.ts`) runs against
+both.
+
+| Property | Both backends |
+|---|---|
+| Lease | Held for `ttlMs` (45s default), renewed every `ttlMs / 3` while the callback runs. A holder that dies stops renewing and its lease expires. |
+| Fencing token | `lease.fencingToken`, strictly increasing per account across all holders (Redis: `INCR` in the same Lua script as `SET NX PX`). |
+| Release | Token-checked (Lua `GET == token` then `DEL` in Redis), on success and on error. A stale holder can't free a newer holder's lock. |
+| Wait | Retries every `retryDelayMs` (in-process also wakes on release) until `maxWaitMs` (30s), then `LOCK_TIMEOUT` 503. |
+| Reentrancy | None. A nested `withLock` on the same account times out. |
+| Fairness | Best effort only; no FIFO guarantee. |
+
+The in-process lock used to wait forever and guarantee FIFO order. It now
+times out like Redis does, so a stuck submission can't hold requests open
+indefinitely.
+
+**Fail closed.** With `LOCK_BACKEND=redis`, the process refuses to start if
+Redis is unreachable, and at runtime the client runs with
+`disableOfflineQueue`, so a Redis outage fails each acquisition at once with
+`LOCK_UNAVAILABLE` (503, retryable). Nothing is ever submitted unlocked.
+
+**Metrics** (`GET /api/v1/health/metrics`): `account_lock_wait_ms`
+(histogram), `account_lock_contended_total`, `account_lock_failures_total`
+(`reason="timeout"|"unavailable"`) and `account_lock_lease_lost_total`, all
+labelled by `backend`.

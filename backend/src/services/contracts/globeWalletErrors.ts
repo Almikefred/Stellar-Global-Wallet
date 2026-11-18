@@ -241,6 +241,12 @@ export const GLOBE_WALLET_ERRORS: Readonly<Record<number, GlobeWalletErrorInfo>>
     apiCode: "RECOVERY_DELAY_TOO_SHORT",
     userMessage: "The recovery timelock delay is below the minimum required ledgers.",
   },
+  1039: {
+    code: 1039,
+    name: "SendsPaused",
+    apiCode: "SENDS_PAUSED",
+    userMessage: "Sending is temporarily paused while an incident is handled. Please try again later.",
+  },
 
   // Backward compatibility aliases for legacy single-digit codes (9..28)
   9: { code: 1009, name: "NoPendingAdmin", apiCode: "NO_PENDING_ADMIN", userMessage: "There is no pending admin transfer to accept." },
