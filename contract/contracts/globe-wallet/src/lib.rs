@@ -57,7 +57,25 @@ pub enum DataKey {
     AllowedToken(Address),
     /// Admin-curated list of all allowed token contract addresses.
     AllowedTokens,
+    // ── Storage layout v2 (issue #184) ──────────────────────────────────────
+    // Appended (never reordered) so every key above keeps its encoding.
+    /// Persistent: ordered guardian list. Replaces instance `Guardians`.
+    /// Only read by `guardians()`, `remove_guardian` and `set_recovery_config`.
+    GuardianSet,
+    /// Persistent, one entry per guardian: presence means "is a guardian".
+    /// Replaces the instance `GuardianMembership` map so a membership check
+    /// reads one small entry instead of loading every guardian.
+    GuardianFlag(Address),
+    /// Persistent: the in-flight recovery proposal. Replaces instance
+    /// `RecoveryProposal`.
+    PendingRecovery,
+    /// Instance: storage layout version. Absent = v1 (legacy instance layout).
+    StorageLayout,
 }
+
+/// Current storage layout version (issue #184). See
+/// `docs/design/storage-layout.md`.
+pub const STORAGE_LAYOUT_VERSION: u32 = 2;
 
 /// `DailySpent` used to live in *temporary* storage while `SpendLimit` lives in
 /// *persistent* storage. Soroban archives temporary entries on its own TTL
@@ -363,6 +381,9 @@ impl GlobeWallet {
         }
         Self::bump_instance_ttl(&env);
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::StorageLayout, &STORAGE_LAYOUT_VERSION);
         env.events()
             .publish((Symbol::new(&env, "initialized"),), admin);
         Ok(())
@@ -609,8 +630,8 @@ impl GlobeWallet {
     pub fn add_guardian(env: Env, admin: Address, guardian: Address) -> Result<(), WalletError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
-        let mut membership = Self::guardian_membership(env.clone());
-        if membership.get(guardian.clone()).unwrap_or(false) {
+        Self::ensure_storage_layout(&env);
+        if Self::is_guardian(&env, &guardian) {
             return Err(WalletError::GuardianAlreadyAdded);
         }
         let mut guardians = Self::guardians(env.clone());
@@ -619,11 +640,8 @@ impl GlobeWallet {
         }
         Self::bump_instance_ttl(&env);
         guardians.push_back(guardian.clone());
-        env.storage().instance().set(&DataKey::Guardians, &guardians);
-        membership.set(guardian.clone(), true);
-        env.storage()
-            .instance()
-            .set(&DataKey::GuardianMembership, &membership);
+        Self::store_guardians(&env, &guardians);
+        Self::set_guardian_flag(&env, &guardian);
         env.events()
             .publish((Symbol::new(&env, "guardian_added"),), guardian);
         Ok(())
@@ -654,8 +672,9 @@ impl GlobeWallet {
     /// This function's rebuild loop below, and `revoke_recovery_approval`'s
     /// approval-list scan, remain O(n). `require_guardian` and
     /// `add_guardian`'s duplicate check are *not* O(n) — both go through the
-    /// `GuardianMembership` map (see [`Self::guardian_membership`]) for an
-    /// O(1)-ish lookup instead of scanning the `Guardians` vector. Decision
+    /// per-guardian `GuardianFlag` persistent entry (issue #184; formerly the
+    /// instance `GuardianMembership` map) for an O(1) lookup instead of
+    /// scanning the `Guardians` vector. Decision
     /// recorded per #45's own framing: now that `MAX_GUARDIANS` (#27) bounds
     /// guardian count to a small constant (15), the remaining O(n) rebuild
     /// here is bounded-but-still-O(n) rather than unbounded, and is not
@@ -665,6 +684,7 @@ impl GlobeWallet {
     pub fn remove_guardian(env: Env, admin: Address, guardian: Address) -> Result<(), WalletError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
+        Self::ensure_storage_layout(&env);
         Self::bump_instance_ttl(&env);
         let guardians = Self::guardians(env.clone());
         let mut new_guardians: Vec<Address> = Vec::new(&env);
@@ -686,14 +706,10 @@ impl GlobeWallet {
                 return Err(WalletError::NotEnoughGuardians);
             }
         }
+        Self::store_guardians(&env, &new_guardians);
         env.storage()
-            .instance()
-            .set(&DataKey::Guardians, &new_guardians);
-        let mut membership = Self::guardian_membership(env.clone());
-        membership.remove(guardian.clone());
-        env.storage()
-            .instance()
-            .set(&DataKey::GuardianMembership, &membership);
+            .persistent()
+            .remove(&DataKey::GuardianFlag(guardian.clone()));
 
         // Strip a stale approval from any pending recovery proposal so a
         // just-removed guardian's earlier vote can no longer count toward
@@ -717,9 +733,7 @@ impl GlobeWallet {
                         proposal.ready_at = None;
                     }
                 }
-                env.storage()
-                    .instance()
-                    .set(&DataKey::RecoveryProposal, &proposal);
+                Self::store_proposal(&env, &proposal);
                 env.events().publish(
                     (Symbol::new(&env, "recovery_approval_invalidated"),),
                     guardian.clone(),
@@ -734,38 +748,39 @@ impl GlobeWallet {
 
     /// Return the current guardian set.
     pub fn guardians(env: Env) -> Vec<Address> {
+        if let Some(guardians) = env.storage().persistent().get(&DataKey::GuardianSet) {
+            return guardians;
+        }
+        // Legacy (v1) layout: not yet migrated.
         env.storage()
             .instance()
             .get(&DataKey::Guardians)
             .unwrap_or_else(|| Vec::new(&env))
     }
 
-    /// Return the guardian membership index. The ordered `Guardians` vector
-    /// remains the public API for enumeration; this map serves recovery-path
-    /// membership checks and duplicate detection.
-    ///
-    /// Contracts upgraded from a version before this index was added only
-    /// have the vector. Build and persist the index once on first access so
-    /// their registered guardians remain authorized after an upgrade.
-    fn guardian_membership(env: Env) -> Map<Address, bool> {
-        if let Some(membership) = env
-            .storage()
-            .instance()
-            .get(&DataKey::GuardianMembership)
-        {
-            return membership;
-        }
-
-        let guardians = Self::guardians(env.clone());
-        let mut membership = Map::new(&env);
-        for i in 0..guardians.len() {
-            membership.set(guardians.get(i).unwrap(), true);
-        }
+    /// Storage layout version in effect (issue #184). `1` = legacy instance
+    /// layout, `2` = guardians/proposal in persistent storage.
+    pub fn storage_layout(env: Env) -> u32 {
         env.storage()
             .instance()
-            .set(&DataKey::GuardianMembership, &membership);
-        membership
+            .get(&DataKey::StorageLayout)
+            .unwrap_or(1)
     }
+
+    /// Admin-triggered migration from the v1 instance layout to v2
+    /// (issue #184). Moves `Guardians`/`GuardianMembership`/`RecoveryProposal`
+    /// out of instance storage into persistent keys. Returns `true` if it
+    /// migrated, `false` if the contract was already on v2. Every guardian or
+    /// recovery write also migrates lazily, so calling this is optional; it
+    /// exists so operators can shrink the instance footprint immediately
+    /// after upgrading instead of waiting for the next guardian write.
+    pub fn migrate_storage_layout(env: Env, admin: Address) -> Result<bool, WalletError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        Self::bump_instance_ttl(&env);
+        Ok(Self::ensure_storage_layout(&env))
+    }
+
 
     /// Configure (or reconfigure) the M-of-N recovery threshold and the
     /// post-quorum timelock delay. Admin-authorized.
@@ -803,7 +818,8 @@ impl GlobeWallet {
     ) -> Result<(), WalletError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
-        if env.storage().instance().has(&DataKey::RecoveryProposal) {
+        Self::ensure_storage_layout(&env);
+        if Self::recovery_proposal(env.clone()).is_some() {
             return Err(WalletError::RecoveryAlreadyPending);
         }
         let guardians = Self::guardians(env.clone());
@@ -851,7 +867,8 @@ impl GlobeWallet {
         guardian.require_auth();
         Self::require_guardian(&env, &guardian)?;
         Self::require_recovery_configured(&env)?;
-        if env.storage().instance().has(&DataKey::RecoveryProposal) {
+        Self::ensure_storage_layout(&env);
+        if Self::recovery_proposal(env.clone()).is_some() {
             return Err(WalletError::RecoveryAlreadyPending);
         }
         Self::bump_instance_ttl(&env);
@@ -862,9 +879,7 @@ impl GlobeWallet {
             approvals,
             ready_at: None,
         };
-        env.storage()
-            .instance()
-            .set(&DataKey::RecoveryProposal, &proposal);
+        Self::store_proposal(&env, &proposal);
         env.events().publish(
             (Symbol::new(&env, "recovery_initiated"),),
             (guardian, new_admin),
@@ -899,9 +914,7 @@ impl GlobeWallet {
                 (proposal.new_admin.clone(), ready_at),
             );
         }
-        env.storage()
-            .instance()
-            .set(&DataKey::RecoveryProposal, &proposal);
+        Self::store_proposal(&env, &proposal);
         env.events()
             .publish((Symbol::new(&env, "recovery_approved"),), guardian);
         Ok(())
@@ -945,9 +958,7 @@ impl GlobeWallet {
         if proposal.approvals.len() < config.threshold {
             proposal.ready_at = None;
         }
-        env.storage()
-            .instance()
-            .set(&DataKey::RecoveryProposal, &proposal);
+        Self::store_proposal(&env, &proposal);
         env.events()
             .publish((Symbol::new(&env, "recovery_approval_revoked"),), guardian);
         Ok(())
@@ -1020,7 +1031,7 @@ impl GlobeWallet {
         env.storage()
             .instance()
             .set(&DataKey::Admin, &proposal.new_admin);
-        env.storage().instance().remove(&DataKey::RecoveryProposal);
+        Self::remove_proposal(&env);
 
         // Read once, before either event moves `old_admin`/`new_admin` by
         // value below — both events need independent copies of the same
@@ -1061,7 +1072,7 @@ impl GlobeWallet {
         Self::require_admin(&env, &admin)?;
         Self::require_pending_recovery(&env)?;
         Self::bump_instance_ttl(&env);
-        env.storage().instance().remove(&DataKey::RecoveryProposal);
+        Self::remove_proposal(&env);
         env.events()
             .publish((Symbol::new(&env, "recovery_cancelled"),), admin);
         Ok(())
@@ -1069,6 +1080,10 @@ impl GlobeWallet {
 
     /// Return the pending recovery proposal, if any.
     pub fn recovery_proposal(env: Env) -> Option<RecoveryProposal> {
+        if let Some(p) = env.storage().persistent().get(&DataKey::PendingRecovery) {
+            return Some(p);
+        }
+        // Legacy (v1) layout: not yet migrated.
         env.storage().instance().get(&DataKey::RecoveryProposal)
     }
 
@@ -1744,13 +1759,97 @@ impl GlobeWallet {
     }
 
     fn require_guardian(env: &Env, caller: &Address) -> Result<(), WalletError> {
-        if Self::guardian_membership(env.clone())
-            .get(caller.clone())
-            .unwrap_or(false)
-        {
+        if Self::is_guardian(env, caller) {
             return Ok(());
         }
         Err(WalletError::Unauthorized)
+    }
+
+    // ── Storage layout v2 helpers (issue #184) ───────────────────────────────
+
+    /// O(1) membership check: one small persistent entry per guardian on v2;
+    /// falls back to the legacy instance map/vector on an unmigrated v1
+    /// contract.
+    fn is_guardian(env: &Env, who: &Address) -> bool {
+        let key = DataKey::GuardianFlag(who.clone());
+        if env.storage().persistent().has(&key) {
+            return true;
+        }
+        if Self::storage_layout(env.clone()) >= STORAGE_LAYOUT_VERSION {
+            return false;
+        }
+        let legacy: Option<Map<Address, bool>> =
+            env.storage().instance().get(&DataKey::GuardianMembership);
+        if let Some(map) = legacy {
+            return map.get(who.clone()).unwrap_or(false);
+        }
+        Self::guardians(env.clone()).contains(who)
+    }
+
+    fn set_guardian_flag(env: &Env, who: &Address) {
+        let key = DataKey::GuardianFlag(who.clone());
+        env.storage().persistent().set(&key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+    }
+
+    fn store_guardians(env: &Env, guardians: &Vec<Address>) {
+        env.storage().persistent().set(&DataKey::GuardianSet, guardians);
+        env.storage().persistent().extend_ttl(
+            &DataKey::GuardianSet,
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+    }
+
+    fn store_proposal(env: &Env, proposal: &RecoveryProposal) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingRecovery, proposal);
+        env.storage().persistent().extend_ttl(
+            &DataKey::PendingRecovery,
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+    }
+
+    fn remove_proposal(env: &Env) {
+        env.storage().persistent().remove(&DataKey::PendingRecovery);
+        env.storage().instance().remove(&DataKey::RecoveryProposal);
+    }
+
+    /// Move v1 instance entries to their v2 persistent keys. Idempotent;
+    /// returns `true` only when it actually migrated. Semantics-preserving,
+    /// so it needs no extra authorization beyond the caller's own path.
+    fn ensure_storage_layout(env: &Env) -> bool {
+        if Self::storage_layout(env.clone()) >= STORAGE_LAYOUT_VERSION {
+            return false;
+        }
+        let instance = env.storage().instance();
+        let legacy_guardians: Option<Vec<Address>> = instance.get(&DataKey::Guardians);
+        let mut moved_guardians: u32 = 0;
+        if let Some(guardians) = legacy_guardians {
+            for g in guardians.iter() {
+                Self::set_guardian_flag(env, &g);
+            }
+            moved_guardians = guardians.len();
+            Self::store_guardians(env, &guardians);
+        }
+        let legacy_proposal: Option<RecoveryProposal> = instance.get(&DataKey::RecoveryProposal);
+        let moved_proposal = legacy_proposal.is_some();
+        if let Some(p) = legacy_proposal {
+            Self::store_proposal(env, &p);
+        }
+        instance.remove(&DataKey::Guardians);
+        instance.remove(&DataKey::GuardianMembership);
+        instance.remove(&DataKey::RecoveryProposal);
+        instance.set(&DataKey::StorageLayout, &STORAGE_LAYOUT_VERSION);
+        env.events().publish(
+            (Symbol::new(env, "storage_migrated"),),
+            (STORAGE_LAYOUT_VERSION, moved_guardians, moved_proposal),
+        );
+        true
     }
 
     fn require_recovery_configured(env: &Env) -> Result<RecoveryConfig, WalletError> {
@@ -3716,5 +3815,160 @@ mod tests {
         // either way) confirms setup was correct and we're not passing
         // vacuously because the limit was never configured.
         assert_eq!(client.get_spend_limit(&user, &code), 1_000_000);
+    }
+
+    // ── Storage layout v2 (issue #184) ──────────────────────────────────────
+
+    #[test]
+    fn test_new_deployment_uses_layout_v2() {
+        let (env, _admin, guardians, client) = setup_with_guardians(3);
+        let cid = client.address.clone();
+        assert_eq!(client.storage_layout(), STORAGE_LAYOUT_VERSION);
+        env.as_contract(&cid, || {
+            // Nothing guardian-related left in instance storage.
+            assert!(!env.storage().instance().has(&DataKey::Guardians));
+            assert!(!env.storage().instance().has(&DataKey::GuardianMembership));
+            assert!(env.storage().persistent().has(&DataKey::GuardianSet));
+            for g in guardians.iter() {
+                assert!(env.storage().persistent().has(&DataKey::GuardianFlag(g)));
+            }
+        });
+    }
+
+    #[test]
+    fn test_recovery_proposal_lives_in_persistent_storage() {
+        let (env, admin, guardians, client) = setup_with_guardians(3);
+        client.set_recovery_config(&admin, &2u32, &GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS);
+        let new_admin = Address::generate(&env);
+        client.initiate_recovery(&guardians.get(0).unwrap(), &new_admin);
+        let cid = client.address.clone();
+        env.as_contract(&cid, || {
+            assert!(!env.storage().instance().has(&DataKey::RecoveryProposal));
+            assert!(env.storage().persistent().has(&DataKey::PendingRecovery));
+        });
+        assert_eq!(client.recovery_proposal().unwrap().new_admin, new_admin);
+    }
+
+    #[test]
+    fn test_removed_guardian_flag_is_cleared() {
+        let (env, admin, guardians, client) = setup_with_guardians(3);
+        let g = guardians.get(0).unwrap();
+        client.remove_guardian(&admin, &g);
+        let cid = client.address.clone();
+        env.as_contract(&cid, || {
+            assert!(!env.storage().persistent().has(&DataKey::GuardianFlag(g.clone())));
+        });
+        let new_admin = Address::generate(&env);
+        // Removed guardian is no longer authorised.
+        assert_eq!(
+            client.try_initiate_recovery(&g, &new_admin),
+            Err(Ok(WalletError::Unauthorized))
+        );
+    }
+
+    /// Recreate the pre-#184 (v1) layout by hand: guardians, membership map
+    /// and an in-flight proposal all in instance storage, no layout key.
+    fn seed_legacy_layout(env: &Env, cid: &Address, guardians: &Vec<Address>, new_admin: &Address) {
+        env.as_contract(cid, || {
+            let inst = env.storage().instance();
+            let mut membership: Map<Address, bool> = Map::new(env);
+            for g in guardians.iter() {
+                membership.set(g, true);
+            }
+            let mut approvals: Vec<Address> = Vec::new(env);
+            approvals.push_back(guardians.get(0).unwrap());
+            inst.set(&DataKey::Guardians, guardians);
+            inst.set(&DataKey::GuardianMembership, &membership);
+            inst.set(
+                &DataKey::RecoveryConfig,
+                &RecoveryConfig { threshold: 2, delay_in_ledgers: GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS },
+            );
+            inst.set(
+                &DataKey::RecoveryProposal,
+                &RecoveryProposal { new_admin: new_admin.clone(), approvals, ready_at: None },
+            );
+            inst.remove(&DataKey::StorageLayout);
+        });
+    }
+
+    #[test]
+    fn test_legacy_layout_still_readable_before_migration() {
+        let (env, cid, _admin, client) = setup();
+        let mut guardians: Vec<Address> = Vec::new(&env);
+        for _ in 0..3 {
+            guardians.push_back(Address::generate(&env));
+        }
+        let new_admin = Address::generate(&env);
+        seed_legacy_layout(&env, &cid, &guardians, &new_admin);
+        assert_eq!(client.storage_layout(), 1);
+        assert_eq!(client.guardians(), guardians);
+        assert_eq!(client.recovery_proposal().unwrap().new_admin, new_admin);
+        // A legacy guardian can still act; its write migrates lazily.
+        client.approve_recovery(&guardians.get(1).unwrap());
+        assert_eq!(client.storage_layout(), STORAGE_LAYOUT_VERSION);
+        assert_eq!(client.recovery_proposal().unwrap().approvals.len(), 2);
+    }
+
+    #[test]
+    fn test_migrate_storage_layout_moves_everything() {
+        let (env, cid, admin, client) = setup();
+        let mut guardians: Vec<Address> = Vec::new(&env);
+        for _ in 0..3 {
+            guardians.push_back(Address::generate(&env));
+        }
+        let new_admin = Address::generate(&env);
+        seed_legacy_layout(&env, &cid, &guardians, &new_admin);
+
+        assert!(client.migrate_storage_layout(&admin));
+        // Second call is a no-op.
+        assert!(!client.migrate_storage_layout(&admin));
+
+        env.as_contract(&cid, || {
+            let inst = env.storage().instance();
+            assert!(!inst.has(&DataKey::Guardians));
+            assert!(!inst.has(&DataKey::GuardianMembership));
+            assert!(!inst.has(&DataKey::RecoveryProposal));
+            assert!(env.storage().persistent().has(&DataKey::PendingRecovery));
+        });
+        assert_eq!(client.guardians(), guardians);
+        assert_eq!(client.recovery_proposal().unwrap().new_admin, new_admin);
+        // Membership survives the move.
+        client.approve_recovery(&guardians.get(2).unwrap());
+    }
+
+    #[test]
+    fn test_migrate_storage_layout_requires_admin() {
+        let (env, _cid, _admin, client) = setup();
+        let stranger = Address::generate(&env);
+        assert_eq!(
+            client.try_migrate_storage_layout(&stranger),
+            Err(Ok(WalletError::Unauthorized))
+        );
+    }
+
+    /// Resource benchmark (issue #184): `record_spend` no longer loads any
+    /// guardian/recovery data because it is not in instance storage any more.
+    /// Prints the CPU/memory cost so before/after numbers can be compared
+    /// with `cargo test -- --nocapture bench_`.
+    #[test]
+    fn bench_record_spend_footprint_with_full_guardian_set() {
+        let (env, admin, guardians, client) = setup_with_guardians(GlobeWallet::MAX_GUARDIANS);
+        client.set_recovery_config(&admin, &3u32, &GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS);
+        client.initiate_recovery(&guardians.get(0).unwrap(), &Address::generate(&env));
+        let user = Address::generate(&env);
+        client.add_asset(&user, &xlm(&env));
+        let code = String::from_str(&env, "XLM");
+        client.set_spend_limit(&user, &code, &1_000_000);
+        let cid = client.address.clone();
+        env.as_contract(&cid, || {
+            // Only hot config remains in instance storage.
+            assert!(!env.storage().instance().has(&DataKey::Guardians));
+            assert!(!env.storage().instance().has(&DataKey::RecoveryProposal));
+        });
+        env.budget().reset_default();
+        client.record_spend(&user, &code, &10);
+        let cpu = env.budget().cpu_instruction_cost();
+        let mem = env.budget().memory_bytes_cost();
+        std::println!("record_spend with 15 guardians + pending recovery: cpu={cpu} mem={mem}");
     }
 }

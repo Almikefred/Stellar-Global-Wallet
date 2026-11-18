@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "contracts/globe-wallet",
     "contracts/token-wrapper",
+    "contracts/smart-account",
+    "contracts/account-factory",
 ]
 
 [workspace.dependencies]
@@ -55,6 +57,11 @@ soroban-sdk = { version = "21.7.7" }
 # every consumer (including `soroban-env-host`) onto the one working
 # version instead of two conflicting ones, and needs no network access
 # beyond the initial `git clone` of this repo to resolve.
+#
+# Issue #183: the copy is verified byte-identical to crates.io in CI
+# (scripts/verify-vendored-ed25519.sh) and is never linked into contract WASM;
+# on-chain verification uses the `ed25519_verify` host function. See
+# docs/design/vendored-ed25519.md.
 [patch.crates-io]
 ed25519-dalek = { path = "vendor/ed25519-dalek-2.2.0" }
 
