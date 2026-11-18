@@ -3,8 +3,7 @@ resolver = "2"
 members = [
     "contracts/globe-wallet",
     "contracts/token-wrapper",
-    "contracts/smart-account",
-    "contracts/account-factory",
+    "contracts/passkey-account",
 ]
 
 [workspace.dependencies]

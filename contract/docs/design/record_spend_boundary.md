@@ -1,111 +1,60 @@
-# `record_spend` Day-Boundary Guarantee Analysis
+# `record_spend` rolling window (issue #177)
 
-## 1. How the bucket is computed
+The old fixed bucket (`day = timestamp / 86_400`) let the full limit be spent
+at 23:59 UTC and again at 00:00 UTC, so the real worst case was 2× the limit.
+`record_spend` now enforces a rolling 24 h window.
+
+## Threat model
+
+A compromised key can sign any `record_spend`/`send`. The limit is the only
+thing capping loss, so the guarantee must hold for every 24 h interval, not
+only for calendar days.
+
+## Data model
+
+One persistent entry per (user, asset): `DataKey::SpendWindow(user, code)` →
 
 ```rust
-let now = env.ledger().timestamp(); // Unix seconds, set by validators
-let day = now / 86_400;             // integer division → UTC midnight bucket
+struct SpendWindow { head_hour: u64, buckets: Vec<i128> } // 25 buckets
 ```
 
-`env.ledger().timestamp()` is the **close time of the ledger** that executes the transaction.
-Stellar validators agree on this timestamp via consensus within a tolerance band
-(the Stellar Core `MAX_CLOSE_TIME_DRIFT`, currently **±1 second** from the network median).
+- Bucket `h % 25` holds the amount spent during hour `h = timestamp / 3600`.
+- Before every read the ring is advanced to the current hour, zeroing buckets
+  that fell out. Storage and CPU are O(1) (25 slots, at most 25 writes).
+- 24 buckets cover the window; the extra guard bucket means a spend is only
+  dropped once it is **more than** 24 h old.
 
----
+**Guarantee:** for the last accepted spend in any interval shorter than 24 h,
+every earlier spend in that interval is less than 24 h old, so it was counted
+when that spend was checked. The total is therefore ≤ the limit. The cost is
+that a spend can stay counted for up to 25 h.
 
-## 2. Exact boundary guarantee
+A token bucket (capacity = limit, refill = limit/86 400 per second) was
+considered and rejected: it keeps refilling while you spend, so it allows up
+to 2× the limit inside one 24 h interval, which is the bug being fixed.
 
-| Timestamp (Unix seconds)  | `day = ts / 86_400` | Bucket           |
-|---------------------------|---------------------|------------------|
-| `N × 86_400 − 1`          | `N − 1`             | previous day     |
-| `N × 86_400`              | `N`                 | **new day — counter resets** |
-| `N × 86_400 + 1`          | `N`                 | same new day     |
+## Related behaviour
 
-**Formal statement:**
+- Spends are recorded whether or not a limit is set (issue #179). Enabling a
+  limit later is checked against what was already spent.
+- `get_spend_allowance` returns `spent`, `remaining`, `window_start`,
+  `window_resets_at` (every counted spend gone) and `next_refill_at` (oldest
+  counted bucket rolls off; 0 when nothing is counted).
+- `migrate_user_assets` never deletes `SpendLimit` or `SpendWindow` (#178).
 
-> Two invocations of `record_spend` whose ledger timestamps satisfy
-> `⌊t₁ / 86400⌋ == ⌊t₂ / 86400⌋` will accumulate into the **same** daily total.
-> Any pair where `⌊t₁ / 86400⌋ ≠ ⌊t₂ / 86400⌋` will each start from a **fresh zero**.
->
-> Proven by tests in `contracts/globe-wallet/src/lib.rs`:
-> - `test_record_spend_exact_day_boundary`
-> - `test_record_spend_boundary_last_second_of_day_accumulates`
-> - `test_record_spend_boundary_first_second_of_new_day_resets`
-> - `test_record_spend_bucket_is_integer_division`
-> - `test_record_spend_boundary_drift_awareness`
+## Failure modes
 
----
+- **Upgrade from the fixed bucket:** if no `SpendWindow` exists but a legacy
+  `DailySpent` record could still overlap the last 24 h, its amount is put in
+  the current hour's bucket. That over-counts for at most 25 h, never
+  under-counts. `record_spend` removes the legacy entry once folded in.
+- **Archival:** the entry lives in persistent storage and its TTL is extended
+  to ~2 days on every write, longer than the 25 h it needs to live.
+- **Clock:** buckets use ledger close time. Validator drift (±1 s) can move a
+  spend into the neighbouring hour bucket. Because of the guard bucket that
+  can only make the window stricter by up to one hour.
+- **Overflow:** with a limit set, a total that would overflow `i128` returns
+  `SpendOverflow`. Without a limit the bookkeeping saturates and never blocks.
 
-## 3. Known edge case: validator timestamp drift at midnight
-
-Stellar ledger close times are **not perfectly uniform**. The consensus protocol
-allows up to ±1 s drift from the network median. Two transactions a human user
-considers simultaneous could receive ledger timestamps straddling an exact
-`N × 86_400` boundary.
-
-**Probability:** 1 / 86,400 ≈ **0.0012%** per pair of back-to-back transactions.
-
-**Effect:** The second transaction lands in a new bucket and its daily counter
-**resets to zero** — giving the user a fresh full daily limit rather than
-accumulating against what they spent seconds before midnight.
-
-**Is this exploitable?**
-
-No. The reset is *more restrictive* than the user expected in the usual case.
-A malicious user cannot use this to exceed their daily cap; they can only
-accidentally benefit from a reset (spending more in a calendar day than
-intended). This is an **edge-case UX confusion, not a security hole**.
-
-`test_record_spend_boundary_drift_awareness` documents this behavior explicitly.
-
----
-
-## 4. Fixed-bucket vs rolling 24 h window
-
-### Fixed bucket (current implementation)
-
-**Pros:**
-- Simple: one storage key per (user, asset), one field (`day`) to invalidate old data.
-- Gas-efficient: no range scan, no ordered log.
-- Predictable reset: users know limits refresh at UTC midnight.
-- No unbounded state growth.
-
-**Cons:**
-- The boundary can split what a human considers "the same session" (±1 s drift,
-  probability 0.001%).
-- A user can spend near-cap just before midnight and again after — effectively
-  2× in a calendar day. This is by-design but may surprise users.
-
-### Rolling 24 h window
-
-**Pros:**
-- Eliminates the midnight double-spend UX issue.
-- More aligned with how users think of "last 24 hours".
-
-**Cons:**
-- Requires storing a **timestamped transaction log** (unbounded state growth), or
-  a circular buffer — complex in a `#![no_std]` Soroban environment.
-- Higher gas per `record_spend` call (scan/sum the window).
-- TTL archival risk: if an old log entry is archived, the window silently widens —
-  harder correctness guarantee than a simple day bucket.
-
----
-
-## 5. Recommendation
-
-**Keep the fixed-bucket design.**
-
-The 0.001% boundary drift risk is not exploitable. The UX confusion (counter
-resetting slightly earlier or later than the user expected) is minor and
-fully documented by the tests.
-
-If the midnight double-spend UX concern becomes a real product issue, the correct
-mitigation (in increasing order of complexity) is:
-
-1. **Client-side warning** in the wallet UI when a spend is attempted within
-   N minutes of UTC midnight.
-2. **Configurable epoch offset** stored per-user: `day = (ts + user_offset) / 86_400`
-   shifts the personal "midnight" without adding on-chain complexity.
-
-Both preserve the O(1) on-chain storage invariant while addressing the UX
-issue at the correct layer.
+Tests: `test_rolling_window_*`, `test_property_rolling_window_never_exceeds_limit_in_any_24h`
+and the #179 order-of-operations tests in `contracts/globe-wallet/src/lib.rs`.

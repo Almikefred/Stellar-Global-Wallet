@@ -77,21 +77,26 @@ export interface RecoveryState {
   proposal: RecoveryProposalView | null;
 }
 
-/** Remaining daily spend allowance for one asset, issue #50. Amounts are stroop strings. */
+/**
+ * Remaining spend allowance for one asset over the rolling 24 h window
+ * (issues #50, #177). Amounts are stroop strings.
+ */
 export interface SpendAllowance {
   assetCode: string;
   /** True when no limit is configured (contract limit of 0). */
   unlimited: boolean;
-  /** Daily cap in stroops; "0" when unlimited. */
+  /** Cap for any rolling 24 h period, in stroops; "0" when unlimited. */
   limit: string;
-  /** Spent in the current window. Always "0" when unlimited (spends aren't tracked then). */
+  /** Spent in the rolling window. Tracked even when unlimited (#179). */
   spent: string;
   /** `limit - spent`, floored at "0"; null when unlimited. */
   remaining: string | null;
-  /** Window start, 00:00:00 UTC by ledger close time. */
+  /** Start of the oldest hourly bucket still counted, by ledger close time. */
   windowStartsAt: string;
-  /** When `spent` resets to "0": the next 00:00:00 UTC by ledger close time. */
+  /** When every currently counted spend has rolled off (now if nothing is counted). */
   windowResetsAt: string;
+  /** When the oldest counted spend rolls off and `remaining` next grows; null when nothing is counted. */
+  nextRefillAt: string | null;
 }
 
 /** One asset search hit for the add-trustline flow, issue #53. */

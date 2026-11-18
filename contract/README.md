@@ -95,15 +95,36 @@ get_assets(env, user) -> Vec<AssetInfo>
 set_spend_limit(env, user, asset_code, limit: i128) -> Result<()>
 get_spend_limit(env, user, asset_code) -> i128
 record_spend(env, user, asset_code, amount) -> Result<()>
+
+// Emergency pause (#191)
+set_pauser(env, admin, pauser: Option<Address>) -> Result<()>  // admin only
+pauser(env) -> Option<Address>
+pause_sends(env, caller) -> Result<()>     // pauser or admin
+unpause_sends(env, admin) -> Result<()>    // admin only (use a multisig admin)
+is_send_paused(env) -> bool
 ```
+
+### Emergency pause
+
+`pause_sends` blocks `send` with `SendsPaused` (1039). Nothing else is paused:
+admin rotation, upgrades, guardian management and social recovery keep
+working, so a pause never locks the owners out of handling the incident. The
+pauser can be a hot incident-response key, because it can only stop sends. It
+cannot unpause or change anything else. Only the admin can unpause, so if the
+admin is a multisig account, unpausing needs the multisig. The backend reports
+the flag at `GET /api/v1/contract/status` (`sendsPaused`).
 
 ### Spend Limit Logic
 
-- Limit is per-user, per-asset, daily (86 400-second window from ledger timestamp).
-- `limit = 0` means unlimited.
+- Limit is per-user, per-asset, over a **rolling 24 h window** (hourly buckets
+  from ledger timestamp, see [docs/design/record_spend_boundary.md](docs/design/record_spend_boundary.md)).
+  There is no midnight reset, so the limit cannot be spent twice around 00:00 UTC.
+- `limit = 0` means unlimited. Spends are still recorded, so a limit set later
+  counts what was already spent.
 - `record_spend` is called from any payment path; rejects with `SpendLimitExceeded` if
-  cumulative daily spend would exceed the limit.
-- Day window resets automatically — no manual reset required.
+  the total spent in the last 24 h would exceed the limit.
+- `get_spend_allowance` reports `spent`, `remaining` and `next_refill_at`.
+- `migrate_user_assets` trims only the display list; limits of trimmed assets stay.
 - Spend limits are enforced **within globe-wallet only**. Transfers routed
   directly through token-wrapper bypass the daily cap unless the integrator
   calls `record_spend` first. See [docs/design/architecture.md](docs/design/architecture.md).

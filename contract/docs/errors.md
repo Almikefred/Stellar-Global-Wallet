@@ -5,7 +5,7 @@
 Soroban smart contract errors are emitted as numeric contract errors: `Error(Contract, #N)`.
 To deliver an accessible and reliable user experience, the frontend and API layers must not expose raw numeric codes or internal stack traces to users. Instead, each error discriminant maps to:
 1. A strongly-typed Rust variant in [`contracts/globe-wallet/src/lib.rs`](../contracts/globe-wallet/src/lib.rs)
-2. A numeric discriminant (1001..1038)
+2. A numeric discriminant (1001..1039)
 3. A stable, machine-readable API code (e.g. `SPEND_LIMIT_EXCEEDED`)
 4. Clear, localized UI copy explaining the issue and recovery action to the user
 
@@ -62,6 +62,7 @@ flowchart LR
 | 1036 | `TokenTransferFailed` | `TOKEN_TRANSFER_FAILED` | The token transfer failed. Please check allowance and account balance. | Ensure adequate token balance and an active token allowance (`approve`). |
 | 1037 | `UpgradeDelayTooShort` | `UPGRADE_DELAY_TOO_SHORT` | The proposed upgrade timelock delay is below the minimum required ledgers. | Upgrade delay must be at least 17,280 ledgers (~24 hours). |
 | 1038 | `RecoveryDelayTooShort` | `RECOVERY_DELAY_TOO_SHORT` | The recovery timelock delay is below the minimum required ledgers. | Recovery delay must be at least 17,280 ledgers (~24 hours). |
+| 1039 | `SendsPaused` | `SENDS_PAUSED` | Sending is temporarily paused while an incident is handled. | Wait for the admin to call `unpause_sends`. Recovery and admin changes still work. |
 
 ## Synchronization Guarantee
 

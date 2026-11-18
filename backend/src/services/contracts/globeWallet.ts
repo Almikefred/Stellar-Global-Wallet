@@ -40,13 +40,15 @@ interface RawRecoveryProposal {
   ready_at?: number | null;
 }
 
-/** Raw `scValToNative` shape of the contract's `SpendAllowance` (#50). */
-interface RawSpendAllowance {
+/** Raw `scValToNative` shape of the contract's `SpendAllowance` (#50, #177). */
+export interface RawSpendAllowance {
   limit: bigint | number | string;
   spent: bigint | number | string;
   remaining: bigint | number | string;
   window_start: bigint | number | string;
   window_resets_at: bigint | number | string;
+  /** Absent on contracts deployed before #177; 0 when nothing is counted. */
+  next_refill_at?: bigint | number | string;
 }
 
 /** Simulation-only source for reads with no natural caller; never needs to exist on-chain. */
@@ -102,6 +104,10 @@ export function toSpendAllowance(assetCode: string, raw: RawSpendAllowance): Spe
     remaining: unlimited ? null : BigInt(raw.remaining).toString(),
     windowStartsAt: unixSecondsToIso(raw.window_start),
     windowResetsAt: unixSecondsToIso(raw.window_resets_at),
+    nextRefillAt:
+      raw.next_refill_at === undefined || BigInt(raw.next_refill_at) === 0n
+        ? null
+        : unixSecondsToIso(raw.next_refill_at),
   };
 }
 
@@ -500,6 +506,26 @@ export class GlobeWalletContract {
   /** Submits a transaction signed by the user (from {@link buildRecordSpend} or any other build) and waits for the result. */
   async submitSigned(signedXdr: string): Promise<SubmitSignedResult | SubmitSignedPending> {
     return withWalletErrorTranslation(this.soroban.submitSigned({ signedXdr }));
+  }
+
+  /**
+   * Emergency-pause status (#191): whether `send` is paused and who the
+   * pauser is. Reads go through the 15-second simulate cache, so a fresh
+   * pause can take up to that long to show here; the contract itself
+   * enforces the pause immediately.
+   */
+  async getContractStatus(): Promise<{ sendsPaused: boolean; pauser: string | null }> {
+    const contractId = requireContractId();
+    const sourcePublicKey = readOnlySource();
+    const [sendsPaused, pauser] = await Promise.all([
+      withWalletErrorTranslation(
+        this.soroban.simulate<boolean>({ contractId, method: "is_send_paused", sourcePublicKey, args: [] })
+      ),
+      withWalletErrorTranslation(
+        this.soroban.simulate<string | null | undefined>({ contractId, method: "pauser", sourcePublicKey, args: [] })
+      ),
+    ]);
+    return { sendsPaused: sendsPaused === true, pauser: pauser ?? null };
   }
 
   /**

@@ -90,6 +90,12 @@ export * from "./format/index.js";
 export * from "./security/index.js";
 
 /**
+ * Token contract ids (#173): spend limits are keyed by the SAC/contract id,
+ * so derive it off-chain from the asset instead of passing a display code.
+ */
+export * from "./token/index.js";
+
+/**
  * HTTP client for the backend REST API (#18): injects the bearer token,
  * refreshes it single-flight on TOKEN_EXPIRED, and retries 429/503 with
  * backoff. Named `ApiClient` because the contract bindings above already
