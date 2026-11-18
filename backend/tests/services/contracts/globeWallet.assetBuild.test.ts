@@ -81,6 +81,7 @@ describe("GlobeWalletContract asset builders (#8)", () => {
         remaining: "100",
         windowStartsAt: "2026-10-20T00:00:00.000Z",
         windowResetsAt: "2026-10-21T00:00:00.000Z",
+        nextRefillAt: null,
       });
     const buildUnsignedTransaction = jest.spyOn(
       SorobanService.prototype,
@@ -104,6 +105,7 @@ describe("GlobeWalletContract asset builders (#8)", () => {
       remaining: null,
       windowStartsAt: "2026-10-20T00:00:00.000Z",
       windowResetsAt: "2026-10-21T00:00:00.000Z",
+      nextRefillAt: null,
     });
     const buildUnsignedTransaction = jest
       .spyOn(SorobanService.prototype, "buildUnsignedTransaction")

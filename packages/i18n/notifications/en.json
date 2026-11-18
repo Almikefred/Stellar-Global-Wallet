@@ -14,6 +14,10 @@
   "guardian.removed.title": "Guardian removed from your wallet",
   "guardian.removed.body": "A guardian has been removed from your wallet's recovery configuration.",
 
+  "migration.asset_untracked.title": "Asset removed from your wallet list",
+  "migration.asset_untracked.body": "{asset} was removed from your asset list during a wallet upgrade. You can add it back at any time.",
+  "migration.asset_untracked.body_limited": "{asset} was removed from your asset list during a wallet upgrade. Its spend limit is still in force. You can add it back at any time.",
+
   "guardian.approval_needed.title": "Recovery approval needed",
   "guardian.approval_needed.body": "A wallet recovery has been initiated and requires your approval.",
 

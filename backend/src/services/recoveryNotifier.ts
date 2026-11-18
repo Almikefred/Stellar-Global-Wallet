@@ -22,6 +22,8 @@
  *   topic[0] = "recovery", topic[1] = "approved"   → owner alert
  *   topic[0] = "guardian", topic[1] = "added"      → owner alert
  *   topic[0] = "guardian", topic[1] = "removed"    → owner alert
+ *   topic[0] = "migration", topic[1] = "asset_untracked" → owner notice (#178,
+ *     handled by assetMigrationNotifier)
  *
  * Deduplication: event IDs from Soroban RPC are stored in Redis (SET NX,
  * 48-hour TTL) so retries never re-deliver.
@@ -32,6 +34,7 @@ import { config } from "../config";
 import { getDevicesForAccounts } from "./deviceRegistry";
 import { sendPushToAll } from "./pushSender";
 import { tNotification } from "./i18nHelper";
+import { isAssetUntrackedTopic, notifyAssetUntracked } from "./assetMigrationNotifier";
 
 const DEDUP_KEY_PREFIX = "orbit-wal:notif-dedup:recovery:";
 const DEDUP_TTL_SECONDS = 48 * 60 * 60;
@@ -145,6 +148,8 @@ async function pollEvents(
             ["recovery", "*"],
             // guardian.added, guardian.removed
             ["guardian", "*"],
+            // migration.asset_untracked (#178)
+            ["migration", "*"],
           ],
         },
       ],
@@ -196,6 +201,11 @@ async function processEvent(event: SorobanEvent): Promise<void> {
   const topic1 = extractTopicString(event.topic[1]);
 
   if (!topic0 || !topic1) return;
+
+  if (isAssetUntrackedTopic(topic0, topic1)) {
+    await notifyAssetUntracked(event.value, { eventId: event.id, contractId: event.contractId });
+    return;
+  }
 
   // Extract the owner address from the event value (contract emits the
   // owner/user address as the event body).

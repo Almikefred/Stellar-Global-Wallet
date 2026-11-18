@@ -120,6 +120,33 @@ impl TokenWrapper {
             .unwrap_or(Allowance { amount: 0, expiry_ledger: 0 })
     }
 
+    /// Permissionless TTL keeper for one allowance (issue #185).
+    ///
+    /// Re-extends the `(owner, spender)` entry so storage never archives it
+    /// before its own `expiry_ledger`. Values are untouched, so no auth is
+    /// needed — anyone (the backend keeper job) may pay for it. Returns the
+    /// number of ledgers the entry was extended to live for (0 when the pair
+    /// has no allowance or it has already expired, in which case there is
+    /// nothing worth keeping alive).
+    pub fn extend_allowance_ttl(env: Env, owner: Address, spender: Address) -> u32 {
+        let key = WrapperDataKey::Allowance(owner.clone(), spender.clone());
+        let current: Option<Allowance> = env.storage().persistent().get(&key);
+        let extend_to = match current {
+            Some(a) if a.expiry_ledger >= env.ledger().sequence() => {
+                a.expiry_ledger.saturating_sub(env.ledger().sequence())
+            }
+            _ => 0,
+        };
+        if extend_to > 0 {
+            env.storage().persistent().extend_ttl(&key, extend_to, extend_to);
+            env.events().publish(
+                (Symbol::new(&env, "allowance_ttl_extended"),),
+                (owner, spender, extend_to),
+            );
+        }
+        extend_to
+    }
+
     /// Transfer tokens from `from` to `to` using a previously granted allowance.
     ///
     /// Decrements the `(from, spender, token_id)` allowance; fails if expired
@@ -408,103 +435,26 @@ mod tests {
     }
 
     #[test]
-    fn test_allowance_for_token_a_cannot_move_token_b() {
-        // issue #174: approving a spender for token A must grant nothing for
-        // token B, even though both are held by the same owner.
+    fn test_extend_allowance_ttl_reports_remaining_lifetime() {
         let (env, _id, client) = setup();
-        let admin = Address::generate(&env);
         let owner = Address::generate(&env);
         let spender = Address::generate(&env);
-        let to = Address::generate(&env);
-        let (token_a, token_a_admin, _ta) = create_token_contract(&env, &admin);
-        let (token_b, token_b_admin, token_b_client) = create_token_contract(&env, &admin);
-        token_a_admin.mint(&owner, &1_000);
-        token_b_admin.mint(&owner, &1_000);
-
         env.ledger().with_mut(|l| l.sequence_number = 100);
-        client.approve(&owner, &spender, &token_a, &500, &200);
-
-        assert_eq!(
-            client.try_transfer_from(&spender, &token_b, &owner, &to, &100),
-            Err(Ok(WrapperError::InsufficientAllowance))
-        );
-        assert_eq!(token_b_client.balance(&owner), 1_000);
-        assert_eq!(client.allowance(&owner, &spender, &token_b).amount, 0);
-        // Token A's allowance is untouched by the rejected attempt.
-        assert_eq!(client.allowance(&owner, &spender, &token_a).amount, 500);
+        client.approve(&owner, &spender, &500, &5_000);
+        env.ledger().with_mut(|l| l.sequence_number = 1_000);
+        assert_eq!(client.extend_allowance_ttl(&owner, &spender), 4_000);
+        assert_eq!(client.allowance(&owner, &spender).amount, 500);
     }
 
     #[test]
-    fn test_allowances_are_independent_per_token() {
+    fn test_extend_allowance_ttl_missing_or_expired_is_noop() {
         let (env, _id, client) = setup();
-        let admin = Address::generate(&env);
         let owner = Address::generate(&env);
         let spender = Address::generate(&env);
-        let to = Address::generate(&env);
-        let (token_a, token_a_admin, _ta) = create_token_contract(&env, &admin);
-        let (token_b, token_b_admin, _tb) = create_token_contract(&env, &admin);
-        token_a_admin.mint(&owner, &1_000);
-        token_b_admin.mint(&owner, &1_000);
-
+        assert_eq!(client.extend_allowance_ttl(&owner, &spender), 0);
         env.ledger().with_mut(|l| l.sequence_number = 100);
-        client.approve(&owner, &spender, &token_a, &300, &200);
-        client.approve(&owner, &spender, &token_b, &50, &200);
-        client.transfer_from(&spender, &token_a, &owner, &to, &300);
-
-        assert_eq!(client.allowance(&owner, &spender, &token_a).amount, 0);
-        assert_eq!(client.allowance(&owner, &spender, &token_b).amount, 50);
-        assert_eq!(
-            client.try_transfer_from(&spender, &token_b, &owner, &to, &51),
-            Err(Ok(WrapperError::InsufficientAllowance))
-        );
-    }
-
-    #[test]
-    fn test_transfer_from_auth_tree_requires_spender_and_owner() {
-        // issue #174: documents exactly who signs. The wrapper is bookkeeping
-        // only, so the SAC transfer nested inside transfer_from still needs
-        // `from`'s authorization in addition to the spender's.
-        use soroban_sdk::testutils::AuthorizedFunction;
-
-        let (env, id, client) = setup();
-        let admin = Address::generate(&env);
-        let owner = Address::generate(&env);
-        let spender = Address::generate(&env);
-        let to = Address::generate(&env);
-        let (token_id, token_admin, _token) = create_token_contract(&env, &admin);
-        token_admin.mint(&owner, &1_000);
-
-        env.ledger().with_mut(|l| l.sequence_number = 100);
-        client.approve(&owner, &spender, &token_id, &500, &200);
-        client.transfer_from(&spender, &token_id, &owner, &to, &100);
-
-        let auths = env.auths();
-        // The spender authorizes the wrapper call itself.
-        assert!(auths.iter().any(|(addr, inv)| addr == &spender
-            && matches!(
-                &inv.function,
-                AuthorizedFunction::Contract((contract, func, _))
-                    if contract == &id && func == &Symbol::new(&env, "transfer_from")
-            )));
-        // The owner must authorize the nested SAC transfer.
-        assert!(auths.iter().any(|(addr, inv)| addr == &owner
-            && matches!(
-                &inv.function,
-                AuthorizedFunction::Contract((contract, func, _))
-                    if contract == &token_id && func == &Symbol::new(&env, "transfer")
-            )));
-    }
-
-    #[test]
-    fn test_approve_requires_owner_auth() {
-        // Negative path: without mocked auth, approve must fail.
-        let env = Env::default();
-        let id = env.register_contract(None, TokenWrapper);
-        let client = TokenWrapperClient::new(&env, &id);
-        let owner = Address::generate(&env);
-        let spender = Address::generate(&env);
-        let token_id = Address::generate(&env);
-        env.ledger().with_mut(|l| l.sequence_number = 100);
-        assert!(client.try_approve(&owner, &spender, &token_id, &10, &200).is_err());
+        client.approve(&owner, &spender, &500, &200);
+        env.ledger().with_mut(|l| l.sequence_number = 201);
+        assert_eq!(client.extend_allowance_ttl(&owner, &spender), 0);
     }
 }

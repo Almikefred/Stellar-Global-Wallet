@@ -42,6 +42,7 @@ import {
   stroopsToXlm,
 } from "./transactionHistory";
 import { getVerifiedAssets } from "./verifiedAssets";
+import { BuildIntent, BuiltTransactionRegistry } from "./builtTransactions";
 
 // Re-exported for backward compatibility — this used to be declared locally
 // here. The canonical definition now lives in packages/types (issue #107)
@@ -146,11 +147,23 @@ export class StellarService {
   private server: StellarSdk.Horizon.Server;
   private networkPassphrase: string;
   private readonly accountLock: AccountLock;
+  /**
+   * #194 — when set, every build is recorded and `submitSigned` refuses
+   * envelopes that don't match a recorded build. Production wiring
+   * (index.ts) always sets it; unit tests that don't care leave it null.
+   */
+  private readonly builtTxs: BuiltTransactionRegistry | null;
 
-  constructor(accountLock: AccountLock = new InProcessAccountLock()) {
+  constructor(accountLock: AccountLock = new InProcessAccountLock(), builtTxs: BuiltTransactionRegistry | null = null) {
     this.networkPassphrase = config.NETWORK_PASSPHRASE;
     this.server = new StellarSdk.Horizon.Server(config.HORIZON_URL);
     this.accountLock = accountLock;
+    this.builtTxs = builtTxs;
+  }
+
+  /** Record an unsigned transaction a build endpoint is about to return (#194). */
+  protected async recordBuilt(tx: StellarSdk.Transaction, intent: BuildIntent): Promise<void> {
+    if (this.builtTxs) await this.builtTxs.record(tx, intent);
   }
 
   generateKeypair(): StellarSdk.Keypair {
@@ -269,6 +282,10 @@ export class StellarService {
       .addOperation(StellarSdk.Operation.changeTrust({ asset, limit: isRemoval ? "0" : limit }))
       .setTimeout(180)
       .build();
+    await this.recordBuilt(transaction, {
+      kind: "trustline",
+      params: { account: accountId, asset: `${assetInfo.code}:${assetInfo.issuer}`, limit: isRemoval ? "0" : limit },
+    });
 
     return {
       xdr: transaction.toXDR(),
@@ -780,8 +797,20 @@ export class StellarService {
       .setTimeout(BUILD_TIMEOUT_SECONDS);
     if (memo) builder.addMemo(StellarSdk.Memo.text(memo));
 
+    const tx = builder.build();
+    await this.recordBuilt(tx, {
+      kind: "payment",
+      params: {
+        sourcePublicKey,
+        destinationPublicKey,
+        amount,
+        asset: asset ?? "XLM",
+        operationType: resolved.operationType,
+        ...(memo ? { memo } : {}),
+      },
+    });
     return {
-      ...describeUnsignedTransaction(builder.build(), this.networkPassphrase),
+      ...describeUnsignedTransaction(tx, this.networkPassphrase),
       operationType: resolved.operationType,
     };
   }
@@ -801,6 +830,8 @@ export class StellarService {
 
   async submitSigned(params: { signedXdr: string }): Promise<SubmitSignedResult | SubmitSignedPending> {
     const parsed = this.parseSignedTransaction(params.signedXdr);
+    // #194 — only relay what this API built (exact hash match).
+    if (this.builtTxs) await this.builtTxs.verify(parsed);
     assertNotExpired(parsed.transaction);
 
     try {
@@ -891,6 +922,10 @@ export class StellarService {
       destAsset,
       memo,
       operation,
+      intent: {
+        kind: "path-payment-strict-send",
+        params: { sourcePublicKey, destinationPublicKey, sendAsset: sendAsset ?? "XLM", sendAmount, destAsset, destMin },
+      },
     });
 
     return {
@@ -934,6 +969,10 @@ export class StellarService {
       destAsset,
       memo,
       operation,
+      intent: {
+        kind: "path-payment-strict-receive",
+        params: { sourcePublicKey, destinationPublicKey, sendAsset: sendAsset ?? "XLM", sendMax, destAsset, destAmount },
+      },
     });
 
     return {
@@ -952,8 +991,9 @@ export class StellarService {
     destAsset: string;
     memo?: string;
     operation: StellarSdk.xdr.Operation;
+    intent: BuildIntent;
   }): Promise<UnsignedTransactionInfo> {
-    const { sourcePublicKey, destinationPublicKey, destAsset, memo, operation } = params;
+    const { sourcePublicKey, destinationPublicKey, destAsset, memo, operation, intent } = params;
     const sourceAccount = await this.loadSourceAccount(sourcePublicKey);
     await this.assertDestinationCanReceive(destinationPublicKey, destAsset, memo);
 
@@ -964,7 +1004,9 @@ export class StellarService {
       .addOperation(operation)
       .setTimeout(BUILD_TIMEOUT_SECONDS);
     if (memo) builder.addMemo(StellarSdk.Memo.text(memo));
-    return describeUnsignedTransaction(builder.build(), this.networkPassphrase);
+    const tx = builder.build();
+    await this.recordBuilt(tx, intent);
+    return describeUnsignedTransaction(tx, this.networkPassphrase);
   }
 
   /**

@@ -8,6 +8,7 @@ import { deprecated } from "../middleware/deprecated";
 import { isGAddress, publicKeyMessage } from "../utils/stellarAddress";
 import { toStroops } from "../utils/stroops";
 import { isValidAccountId } from "../validation/historyQuery";
+import { getUpgradeWatcherStatus } from "../services/upgradeWatcher";
 
 /** Largest value a Soroban i128 can hold. */
 const I128_MAX = 2n ** 127n - 1n;
@@ -119,6 +120,16 @@ export function createContractRouter(globeWallet: GlobeWalletContract): Router {
     }
   });
 
+  // #191 — emergency pause status flag. Public: clients use it to explain
+  // why sends fail with SENDS_PAUSED and to hide the send action meanwhile.
+  contractRouter.get("/status", async (_req, res, next) => {
+    try {
+      res.json(await globeWallet.getContractStatus());
+    } catch (err) {
+      next(err);
+    }
+  });
+
   // #80 — Settings screen: read current admin and pending admin candidate (null-safe)
   contractRouter.get("/admin", async (_req, res, next) => {
     try {
@@ -134,6 +145,17 @@ export function createContractRouter(globeWallet: GlobeWalletContract): Router {
     try {
       const pendingUpgrade = await globeWallet.getPendingUpgrade();
       res.json({ pendingUpgrade });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // #186 — public upgrade announcements: what the upgrade watcher has seen
+  // (pending proposal + recent history) alongside the on-chain timelock.
+  contractRouter.get("/upgrade/status", async (_req, res, next) => {
+    try {
+      const pendingUpgrade = await globeWallet.getPendingUpgrade();
+      res.json({ pendingUpgrade, watcher: getUpgradeWatcherStatus() });
     } catch (err) {
       next(err);
     }

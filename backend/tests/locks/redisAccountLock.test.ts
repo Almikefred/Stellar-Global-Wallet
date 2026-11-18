@@ -1,109 +1,52 @@
 import { createClient, RedisClientType } from "redis";
 import { RedisAccountLock } from "../../src/services/locks/redisAccountLock";
-import { LockAcquisitionError } from "../../src/services/stellarErrors";
+import { LockUnavailableError } from "../../src/services/stellarErrors";
+import { describeAccountLockContract } from "./accountLockContract";
 
 const REDIS_URL = process.env.REDIS_URL_TEST ?? "redis://localhost:6379";
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-// These run against a real local Redis (redis-server on localhost:6379) —
-// this is the mechanism meant to close the multi-instance gap that
-// in-process locking cannot (docs/concurrency.md), so it's exercised for
-// real rather than mocked.
-describe("RedisAccountLock (real Redis, simulating two API instances)", () => {
-  let clientA: RedisClientType;
-  let clientB: RedisClientType;
+// Runs against a real local Redis (redis-server on localhost:6379): this is
+// the backend that closes the multi-instance gap (docs/concurrency.md), so
+// the shared contract is exercised for real rather than mocked. Two
+// connections stand in for two API instances.
+describe("RedisAccountLock (real Redis)", () => {
+  const clients: RedisClientType[] = [];
 
   beforeAll(async () => {
-    clientA = createClient({ url: REDIS_URL });
-    clientB = createClient({ url: REDIS_URL });
-    await clientA.connect();
-    await clientB.connect();
+    for (let i = 0; i < 2; i++) {
+      const client = createClient({ url: REDIS_URL }) as RedisClientType;
+      await client.connect();
+      clients.push(client);
+    }
   });
 
   afterAll(async () => {
-    await clientA.quit();
-    await clientB.quit();
+    await Promise.all(clients.map((c) => c.quit()));
   });
 
-  it("serializes withLock calls for the same account across two independent clients", async () => {
-    // Two separate Redis connections standing in for two separate API
-    // processes, each with its own RedisAccountLock instance — nothing
-    // in-process is shared between them.
-    const lockA = new RedisAccountLock(clientA, { retryDelayMs: 10, maxWaitMs: 5000 });
-    const lockB = new RedisAccountLock(clientB, { retryDelayMs: 10, maxWaitMs: 5000 });
+  let next = 0;
+  describeAccountLockContract("RedisAccountLock", (options) => new RedisAccountLock(clients[next++ % 2], options));
+});
 
-    const accountId = `test-account-${Date.now()}`;
-    const events: string[] = [];
+describe("RedisAccountLock fails closed", () => {
+  it("throws LOCK_UNAVAILABLE without running the callback when Redis errors", async () => {
+    const client = {
+      isReady: true,
+      eval: jest.fn().mockRejectedValue(new Error("ECONNREFUSED")),
+    } as unknown as RedisClientType;
+    const fn = jest.fn();
 
-    const taskOnInstance = (lock: RedisAccountLock, name: string, delayMs: number) =>
-      lock.withLock(accountId, async () => {
-        events.push(`${name}:start`);
-        await sleep(delayMs);
-        events.push(`${name}:end`);
-        return name;
-      });
+    const err = await new RedisAccountLock(client).withLock("acct", fn).catch((e) => e);
 
-    // Both instances race to acquire the same account lock over separate
-    // Redis connections — which one wins is a genuine network race and
-    // isn't (and shouldn't be) deterministic. What must hold regardless of
-    // winner is mutual exclusion: one holder's start/end pair never
-    // interleaves with the other's.
-    await Promise.all([
-      taskOnInstance(lockA, "instanceA", 60),
-      taskOnInstance(lockB, "instanceB", 60),
-    ]);
-
-    expect(events).toHaveLength(4);
-    const [first, second, third, fourth] = events;
-    const winner = first.split(":")[0];
-    const loser = winner === "instanceA" ? "instanceB" : "instanceA";
-    expect([first, second, third, fourth]).toEqual([
-      `${winner}:start`,
-      `${winner}:end`,
-      `${loser}:start`,
-      `${loser}:end`,
-    ]);
-  }, 10000);
-
-  it("does not serialize different account ids against each other", async () => {
-    const lockA = new RedisAccountLock(clientA, { retryDelayMs: 10, maxWaitMs: 5000 });
-    const events: string[] = [];
-
-    const start = Date.now();
-    await Promise.all([
-      lockA.withLock(`acct-x-${Date.now()}`, async () => {
-        events.push("x:start");
-        await sleep(50);
-        events.push("x:end");
-      }),
-      lockA.withLock(`acct-y-${Date.now()}`, async () => {
-        events.push("y:start");
-        await sleep(50);
-        events.push("y:end");
-      }),
-    ]);
-    const elapsedMs = Date.now() - start;
-
-    expect(elapsedMs).toBeLessThan(90);
+    expect(err).toBeInstanceOf(LockUnavailableError);
+    expect(err.code).toBe("LOCK_UNAVAILABLE");
+    expect(fn).not.toHaveBeenCalled();
   });
 
-  it("throws a clear LockAcquisitionError when the lock cannot be acquired in time", async () => {
-    const accountId = `test-account-timeout-${Date.now()}`;
-    const lockA = new RedisAccountLock(clientA, { retryDelayMs: 10, maxWaitMs: 5000 });
-    const lockB = new RedisAccountLock(clientB, { retryDelayMs: 10, maxWaitMs: 100 });
+  it("throws LOCK_UNAVAILABLE when the client is disconnected", async () => {
+    const client = { isReady: false, eval: jest.fn() } as unknown as RedisClientType;
 
-    const holderPromise = lockA.withLock(accountId, async () => {
-      await sleep(500);
-    });
-
-    await sleep(20); // let lockA acquire first
-    await expect(lockB.withLock(accountId, async () => "should not run")).rejects.toBeInstanceOf(
-      LockAcquisitionError
-    );
-
-    await holderPromise;
-  }, 10000);
+    await expect(new RedisAccountLock(client).withLock("acct", jest.fn())).rejects.toBeInstanceOf(LockUnavailableError);
+    expect((client as unknown as { eval: jest.Mock }).eval).not.toHaveBeenCalled();
+  });
 });
