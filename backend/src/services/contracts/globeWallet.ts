@@ -40,13 +40,15 @@ interface RawRecoveryProposal {
   ready_at?: number | null;
 }
 
-/** Raw `scValToNative` shape of the contract's `SpendAllowance` (#50). */
-interface RawSpendAllowance {
+/** Raw `scValToNative` shape of the contract's `SpendAllowance` (#50, #177). */
+export interface RawSpendAllowance {
   limit: bigint | number | string;
   spent: bigint | number | string;
   remaining: bigint | number | string;
   window_start: bigint | number | string;
   window_resets_at: bigint | number | string;
+  /** Absent on contracts deployed before #177; 0 when nothing is counted. */
+  next_refill_at?: bigint | number | string;
 }
 
 /** Simulation-only source for reads with no natural caller; never needs to exist on-chain. */
@@ -102,6 +104,10 @@ export function toSpendAllowance(assetCode: string, raw: RawSpendAllowance): Spe
     remaining: unlimited ? null : BigInt(raw.remaining).toString(),
     windowStartsAt: unixSecondsToIso(raw.window_start),
     windowResetsAt: unixSecondsToIso(raw.window_resets_at),
+    nextRefillAt:
+      raw.next_refill_at === undefined || BigInt(raw.next_refill_at) === 0n
+        ? null
+        : unixSecondsToIso(raw.next_refill_at),
   };
 }
 
