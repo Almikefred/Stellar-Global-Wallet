@@ -24,7 +24,12 @@ import {
   memoTextMessage,
 } from "@globe-wallet/sdk";
 import * as StellarSdk from "@stellar/stellar-sdk";
-import { getCachedResult, cacheResult } from "../services/idempotency";
+import {
+  claimIdempotencyKey,
+  commitIdempotencyResult,
+  releaseIdempotencyKey,
+  requestFingerprint,
+} from "../services/idempotency";
 import { createClientSigningRouter } from "./clientSigning";
 
 const SEP7_PAY_PREFIX = "web+stellar:pay?";
@@ -107,23 +112,65 @@ async function handleIdempotentRequest(
 ) {
   try {
     assertValidRequest(req);
-    const idempotencyKey = req.body.idempotencyKey;
+    const idempotencyKey: string | undefined = req.body.idempotencyKey;
     let sourcePublicKey: string | undefined;
+    let fingerprint: string | undefined;
 
     if (idempotencyKey && secretKey) {
       const keypair = StellarSdk.Keypair.fromSecret(secretKey);
       sourcePublicKey = keypair.publicKey();
-      const cached = await getCachedResult(sourcePublicKey, idempotencyKey);
-      if (cached) {
-        res.json({ hash: cached.hash, successful: cached.successful });
+      // Bind the key to the request body so the same key cannot be reused
+      // for a different payload (#198 — request fingerprint).
+      fingerprint = requestFingerprint(req.body);
+
+      const claim = await claimIdempotencyKey(sourcePublicKey, idempotencyKey, fingerprint);
+
+      if (claim.status === "hit") {
+        res.json({ hash: claim.result.hash, successful: claim.result.successful });
         return;
       }
+      if (claim.status === "conflict") {
+        res.status(422).json({
+          error: {
+            code: "IDEMPOTENCY_KEY_REUSED",
+            message:
+              "This idempotency key was already used for a different request body. Use a new key.",
+          },
+        });
+        return;
+      }
+      if (claim.status === "in-flight") {
+        res.status(409).json({
+          error: {
+            code: "IDEMPOTENCY_KEY_IN_FLIGHT",
+            message: "This request is still being processed. Retry in a moment.",
+            retryable: true,
+          },
+        });
+        return;
+      }
+      // claim.status === "claimed" — fall through to execute.
     }
 
-    const result = await execute();
+    let result: { hash: string; successful: boolean };
+    try {
+      result = await execute();
+    } catch (execErr) {
+      // Release the sentinel so the client can retry with the same key.
+      if (sourcePublicKey && idempotencyKey) {
+        await releaseIdempotencyKey(sourcePublicKey, idempotencyKey);
+      }
+      throw execErr;
+    }
 
-    if (idempotencyKey && sourcePublicKey) {
-      await cacheResult(sourcePublicKey, idempotencyKey, result.hash, result.successful);
+    if (sourcePublicKey && idempotencyKey && fingerprint) {
+      await commitIdempotencyResult(
+        sourcePublicKey,
+        idempotencyKey,
+        fingerprint,
+        result.hash,
+        result.successful
+      );
     }
 
     res.json({ hash: result.hash, successful: result.successful });
@@ -329,6 +376,35 @@ export function createWalletRouter(stellar: StellarService): Router {
     body("idempotencyKey").optional().isString().isLength({ max: 255 }),
     (req, res, next) =>
       handleIdempotentRequest(req, res, next, req.body.feeSecretKey, () => stellar.feeBumpTransaction(req.body))
+  );
+
+  // #195 — sponsored fee-bump: the server pays fees on behalf of a user whose
+  // account has insufficient XLM. The inner transaction must already be signed
+  // by the account's key; the backend wraps it in a fee-bump envelope using
+  // the FEE_SPONSOR_SECRET_KEY configured in the environment.
+  walletRouter.post(
+    "/sponsor-fee",
+    body("transactionXdr").isString().notEmpty(),
+    body("innerAccount")
+      .isLength({ min: 56, max: 56 })
+      .bail()
+      .custom(isGAddress)
+      .withMessage(publicKeyMessage),
+    async (req, res, next) => {
+      try {
+        assertValidRequest(req);
+        const { sponsorFeeBump } = await import("../services/feeSponsorship");
+        const result = await sponsorFeeBump(
+          req.body.innerAccount,
+          req.body.transactionXdr,
+          config.HORIZON_URL,
+          config.NETWORK_PASSPHRASE
+        );
+        res.json(result);
+      } catch (err) {
+        next(err);
+      }
+    }
   );
 
   walletRouter.post(

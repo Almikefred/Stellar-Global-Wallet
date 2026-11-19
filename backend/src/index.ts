@@ -2,6 +2,7 @@ import "dotenv/config";
 import { config } from "./config";
 import { createApp } from "./app";
 import { ensureAuditTable, pool } from "./db";
+import { initKeys } from "./utils/jwtKeys";
 import { BuiltTransactionRegistry, PgBuiltTransactionStore } from "./services/builtTransactions";
 import { StellarService } from "./services/stellar";
 import { createAccountLock } from "./services/locks/createAccountLock";
@@ -23,6 +24,8 @@ async function main() {
   const app = createApp(stellar);
 
   await ensureAuditTable();
+  // #199 — load (or generate on first boot) asymmetric JWT signing keys.
+  await initKeys();
 
   const server = app.listen(config.PORT, () => {
     console.log(

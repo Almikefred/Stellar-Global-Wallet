@@ -4,6 +4,7 @@ import { ensureDevicesTable } from "./services/deviceRegistry";
 import { ensureVerifiedEmailsTable } from "./services/emailVerification";
 import { ensurePreferencesTable } from "./routes/preferences";
 import { ensureBuiltTransactionsTable } from "./services/builtTransactions";
+import { ensureFeeSponsorshipTable } from "./services/feeSponsorship";
 
 export const pool = new Pool({ connectionString: config.DATABASE_URL });
 
@@ -23,10 +24,22 @@ export async function ensureAuditTable() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       source_public_key VARCHAR(56) NOT NULL,
       idempotency_key VARCHAR(255) NOT NULL,
-      result_hash VARCHAR(64) NOT NULL,
-      result_successful BOOLEAN NOT NULL,
+      -- SHA-256 of the canonical request body; prevents key reuse across
+      -- different payloads (#198 request fingerprint).
+      request_fingerprint VARCHAR(64) NOT NULL DEFAULT '',
+      result_hash VARCHAR(64) NOT NULL DEFAULT '',
+      result_successful BOOLEAN NOT NULL DEFAULT false,
+      -- false while the operation is in-flight; true once committed (#198).
+      committed BOOLEAN NOT NULL DEFAULT false,
       UNIQUE (source_public_key, idempotency_key)
     )
+  `);
+
+  // Add new columns if they were missing from an earlier schema version.
+  await pool.query(`
+    ALTER TABLE idempotency_keys
+      ADD COLUMN IF NOT EXISTS request_fingerprint VARCHAR(64) NOT NULL DEFAULT '',
+      ADD COLUMN IF NOT EXISTS committed BOOLEAN NOT NULL DEFAULT false
   `);
 
   // #87 — device token table for push notifications.
@@ -46,6 +59,9 @@ export async function ensureAuditTable() {
 
   // #194 — hashes of transactions the build endpoints returned.
   await ensureBuiltTransactionsTable(pool);
+
+  // #195 — per-user fee-sponsorship budget tracking.
+  await ensureFeeSponsorshipTable(pool);
 }
 
 export async function ensurePendingTxsTable(db: Pool) {
