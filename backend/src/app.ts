@@ -24,6 +24,7 @@ import { createDevRouter } from "./routes/dev";
 import { createPreferencesRouter } from "./routes/preferences";
 import { localeMiddleware } from "./middleware/locale";
 import { errorHandler } from "./middleware/errorHandler";
+import { requireLoginApiKey } from "./middleware/loginApiKey";
 import { config } from "./config";
 import { renderMetrics } from "./services/metrics";
 import { StellarService } from "./services/stellar";
@@ -439,6 +440,27 @@ export function createApp(
       swaggerUi.setup(openApiSpec, { customSiteTitle: "Stellar Global Wallet API" })
     );
   }
+
+  // #199 — JWKS endpoint: publish the public halves of active signing keys so
+  // external verifiers never need the private key or the shared JWT_SECRET.
+  // RFC 7517 format; cache-friendly (keys change only on rotation).
+  app.get("/.well-known/jwks.json", (_req, res) => {
+    const { getJwks } = require("./utils/jwtKeys") as typeof import("./utils/jwtKeys");
+    res.set("Cache-Control", "public, max-age=3600").json(getJwks());
+  });
+
+  // #199 — Admin endpoint to trigger key rotation. Protected by the API_KEY
+  // so only operators can call it; intended for scheduled rotation (cron /
+  // CI pipeline) rather than automated in-band rotation.
+  app.post("/api/v1/admin/rotate-jwt-keys", requireLoginApiKey, async (_req, res, next) => {
+    try {
+      const { rotatePrimaryKey } = await import("./utils/jwtKeys");
+      await rotatePrimaryKey();
+      res.json({ rotated: true });
+    } catch (err) {
+      next(err);
+    }
+  });
 
   // Routes
   app.use("/api/v1/wallet", createWalletRouter(stellar));

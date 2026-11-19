@@ -2,6 +2,7 @@ import jwt from "jsonwebtoken";
 import { randomUUID } from "crypto";
 import { createClient, RedisClientType } from "redis";
 import { config } from "../config";
+import { getCurrentKey, findKeyByKid } from "./jwtKeys";
 
 export type AuthMethod = "api-key" | "sep10";
 
@@ -54,13 +55,39 @@ const ACCOUNT_SESSIONS_KEY_PREFIX = "orbit-wal:account-sessions:";
 export function generateAccessToken(sub: string, authMethod?: AuthMethod): string {
   const payload: TokenPayload = { sub, type: "access" };
   if (authMethod) payload.auth_method = authMethod;
-  return jwt.sign(payload, config.JWT_SECRET, {
+  // Sign with the current RSA private key; embed the kid so verifiers can
+  // fetch the right public key from the JWKS endpoint (#199).
+  const signingKey = getCurrentKey();
+  return jwt.sign(payload, signingKey.privateKey.export({ type: "pkcs8", format: "pem" }) as string, {
+    algorithm: "RS256",
     expiresIn: ACCESS_EXPIRY,
+    keyid: signingKey.kid,
   });
 }
 
 export function verifyAccessToken(token: string): TokenPayload {
-  return jwt.verify(token, config.JWT_SECRET) as TokenPayload;
+  // Decode the header to find the kid, then pick the right public key (#199).
+  const decoded = jwt.decode(token, { complete: true });
+  const kid = typeof decoded?.header?.kid === "string" ? decoded.header.kid : undefined;
+
+  if (kid) {
+    const key = findKeyByKid(kid);
+    if (key) {
+      return jwt.verify(
+        token,
+        key.publicKey.export({ type: "spki", format: "pem" }) as string,
+        { algorithms: ["RS256"] }
+      ) as TokenPayload;
+    }
+  }
+
+  // Fallback: try the current key (handles tokens where kid header is missing).
+  const currentKey = getCurrentKey();
+  return jwt.verify(
+    token,
+    currentKey.publicKey.export({ type: "spki", format: "pem" }) as string,
+    { algorithms: ["RS256"] }
+  ) as TokenPayload;
 }
 
 /**
