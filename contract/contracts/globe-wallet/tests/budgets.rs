@@ -141,22 +141,35 @@ fn measure_all() -> BTreeMap<std::string::String, Cost> {
     });
     r.measure("globe_wallet.get_assets", || w.get_assets(&user));
     r.measure("globe_wallet.remove_asset", || w.remove_asset(&user, &usdc));
-    r.measure("globe_wallet.set_spend_limit", || w.set_spend_limit(&user, &xlm, &1_000_000));
-    r.measure("globe_wallet.get_spend_limit", || w.get_spend_limit(&user, &xlm));
-    r.measure("globe_wallet.record_spend", || w.record_spend(&user, &xlm, &10));
-    r.measure("globe_wallet.get_spent_today", || w.get_spent_today(&user, &xlm));
-    r.measure("globe_wallet.get_spend_allowance", || w.get_spend_allowance(&user, &xlm));
-    r.measure("globe_wallet.is_limit_archived", || w.is_limit_archived(&user, &xlm));
+    let xlm_token = Address::generate(&env);
+    r.measure("globe_wallet.set_spend_limit", || w.set_spend_limit(&user, &xlm_token, &1_000_000));
+    r.measure("globe_wallet.get_spend_limit", || w.get_spend_limit(&user, &xlm_token));
+    r.measure("globe_wallet.record_spend", || w.record_spend(&user, &xlm_token, &10));
+    r.measure("globe_wallet.get_spent_today", || w.get_spent_today(&user, &xlm_token));
+    r.measure("globe_wallet.get_spend_allowance", || w.get_spend_allowance(&user, &xlm_token));
+    r.measure("globe_wallet.is_limit_archived", || w.is_limit_archived(&user, &xlm_token));
     r.measure("globe_wallet.extend_user_ttl", || w.extend_user_ttl(&user));
     r.measure("globe_wallet.migrate_user_assets", || w.migrate_user_assets(&admin, &user));
 
     // ── token wiring ──
     let sac = env.register_stellar_asset_contract_v2(Address::generate(&env));
     let token_id = sac.address();
+    let issuer_key = match soroban_sdk::xdr::ScAddress::from(&sac.issuer().address()) {
+        soroban_sdk::xdr::ScAddress::Account(soroban_sdk::xdr::AccountId(
+            soroban_sdk::xdr::PublicKey::PublicKeyTypeEd25519(soroban_sdk::xdr::Uint256(k)),
+        )) => BytesN::from_array(&env, &k),
+        _ => panic!("SAC issuer must be an account"),
+    };
     token::StellarAssetClient::new(&env, &token_id).mint(&user, &1_000_000);
     r.measure("globe_wallet.set_token_wrapper", || w.set_token_wrapper(&admin, &wrapper_id));
     r.measure("globe_wallet.get_token_wrapper", || w.get_token_wrapper());
-    r.measure("globe_wallet.add_allowed_token", || w.add_allowed_token(&admin, &token_id));
+    let sac_code = String::from_str(&env, "aaa");
+    r.measure("globe_wallet.propose_allowed_token", || {
+        w.propose_allowed_token(&admin, &token_id, &sac_code, &Some(issuer_key.clone()))
+    });
+    let ready_at = w.pending_allowed_token(&token_id).unwrap().ready_at;
+    env.ledger().with_mut(|l| l.sequence_number = ready_at);
+    r.measure("globe_wallet.execute_allowed_token", || w.execute_allowed_token(&admin, &token_id));
     r.measure("globe_wallet.is_token_allowed", || w.is_token_allowed(&token_id));
     r.measure("globe_wallet.get_allowed_tokens", || w.get_allowed_tokens());
     r.measure("globe_wallet.allowed_tokens", || w.allowed_tokens());
@@ -165,7 +178,7 @@ fn measure_all() -> BTreeMap<std::string::String, Cost> {
     r.measure("token_wrapper.allowance", || tw.allowance(&user, &wallet_id, &token_id));
     r.measure("token_wrapper.extend_allowance_ttl", || tw.extend_allowance_ttl(&user, &wallet_id, &token_id));
     let to = Address::generate(&env);
-    r.measure("globe_wallet.send", || w.send(&user, &token_id, &xlm, &to, &100));
+    r.measure("globe_wallet.send", || w.send(&user, &token_id, &to, &100));
     let spender = Address::generate(&env);
     tw.approve(&user, &spender, &token_id, &1_000, &expiry);
     r.measure("token_wrapper.transfer_from", || tw.transfer_from(&spender, &token_id, &user, &to, &10));

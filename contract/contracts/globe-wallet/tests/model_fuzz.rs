@@ -240,7 +240,10 @@ struct Harness {
     env: Env,
     client: GlobeWalletClient<'static>,
     actors: std::vec::Vec<Address>,
+    #[allow(dead_code)]
     xlm: String,
+    /// Spend limits are keyed by token address (issue #173).
+    xlm_token: Address,
 }
 
 impl Harness {
@@ -253,6 +256,7 @@ impl Harness {
         let actors: std::vec::Vec<Address> = (0..ACTORS).map(|_| Address::generate(&env)).collect();
         client.initialize(&actors[0]);
         let xlm = String::from_str(&env, "XLM");
+        let xlm_token = Address::generate(&env);
         // Register XLM for every actor so `extend_user_ttl` covers their
         // spend entries (it walks the user's asset list).
         for a in &actors {
@@ -263,7 +267,7 @@ impl Harness {
             ts: env.ledger().timestamp(),
             ..Model::default()
         };
-        (Self { env, client, actors, xlm }, model)
+        (Self { env, client, actors, xlm, xlm_token }, model)
     }
 
     fn call(&self, op: &Op) -> bool {
@@ -280,8 +284,8 @@ impl Harness {
             Op::RevokeApproval { guardian } => c.try_revoke_recovery_approval(&a[guardian]).is_ok(),
             Op::ExecuteRecovery => c.try_execute_recovery().is_ok(),
             Op::CancelRecovery { caller } => c.try_cancel_recovery(&a[caller]).is_ok(),
-            Op::SetSpendLimit { user, limit } => c.try_set_spend_limit(&a[user], &self.xlm, &limit).is_ok(),
-            Op::RecordSpend { user, amount } => c.try_record_spend(&a[user], &self.xlm, &amount).is_ok(),
+            Op::SetSpendLimit { user, limit } => c.try_set_spend_limit(&a[user], &self.xlm_token, &limit).is_ok(),
+            Op::RecordSpend { user, amount } => c.try_record_spend(&a[user], &self.xlm_token, &amount).is_ok(),
             Op::AdvanceLedgers(n) => {
                 self.env.ledger().with_mut(|l| l.sequence_number += n);
                 true
@@ -319,8 +323,8 @@ impl Harness {
             }
         }
         for (u, addr) in self.actors.iter().enumerate() {
-            let limit = c.get_spend_limit(addr, &self.xlm);
-            let spent = c.get_spent_today(addr, &self.xlm);
+            let limit = c.get_spend_limit(addr, &self.xlm_token);
+            let spent = c.get_spent_today(addr, &self.xlm_token);
             assert_eq!(limit, m.limits[u], "limit diverged for actor {u} at step {step} ({op:?})");
             if limit > 0 {
                 // Core invariant: spent today never exceeds the limit.
