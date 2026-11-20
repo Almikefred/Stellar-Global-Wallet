@@ -185,7 +185,31 @@ export class FxService {
  */
 export function convertFromUsd(amountUsd: string | null, rate: string): string | null {
   if (amountUsd === null) return null;
-  const value = Number(amountUsd) * Number(rate);
-  if (!Number.isFinite(value)) return null;
-  return value >= 1 ? value.toFixed(2) : value.toFixed(7);
+  try {
+    const [rateWhole, rateFrac = ""] = rate.split(".");
+    const rateScale = rateFrac.length;
+    const rateInt = BigInt(rateWhole + rateFrac);
+
+    const [usdWhole, usdFrac = ""] = amountUsd.split(".");
+    const usdScale = usdFrac.length;
+    const usdInt = BigInt(usdWhole + usdFrac);
+
+    const product = usdInt * rateInt;
+    const totalScale = rateScale + usdScale;
+    const divisor = 10n ** BigInt(totalScale);
+
+    const whole = product / divisor;
+    const rem = product % divisor;
+
+    const targetDecimals = whole >= 1n ? 2 : 7;
+    const factor = 10n ** BigInt(targetDecimals);
+    const scaledRem = (rem * factor + divisor / 2n) / divisor;
+    const finalRemStr = scaledRem.toString().padStart(targetDecimals, "0").slice(0, targetDecimals);
+
+    return `${whole}.${finalRemStr}`;
+  } catch {
+    const value = Number(amountUsd) * Number(rate);
+    if (!Number.isFinite(value)) return null;
+    return value >= 1 ? value.toFixed(2) : value.toFixed(7);
+  }
 }

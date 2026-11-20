@@ -52,9 +52,10 @@ const REFRESH_KEY_PREFIX = "orbit-wal:refresh-token:";
 const SESSION_KEY_PREFIX = "orbit-wal:session:";
 const ACCOUNT_SESSIONS_KEY_PREFIX = "orbit-wal:account-sessions:";
 
-export function generateAccessToken(sub: string, authMethod?: AuthMethod): string {
-  const payload: TokenPayload = { sub, type: "access" };
+export function generateAccessToken(sub: string, authMethod?: AuthMethod, sessionId?: string): string {
+  const payload: TokenPayload & { session_id?: string } = { sub, type: "access" };
   if (authMethod) payload.auth_method = authMethod;
+  if (sessionId) payload.session_id = sessionId;
   // Sign with the current RSA private key; embed the kid so verifiers can
   // fetch the right public key from the JWKS endpoint (#199).
   const signingKey = getCurrentKey();
@@ -326,7 +327,7 @@ export async function rotateRefreshToken(
   const result = await getDefaultStore().rotate(oldToken, metadata);
   if (!result) return null;
   return {
-    accessToken: generateAccessToken(result.sub, result.authMethod),
+    accessToken: generateAccessToken(result.sub, result.authMethod, result.sessionId),
     refreshToken: result.token,
     sessionId: result.sessionId,
   };
