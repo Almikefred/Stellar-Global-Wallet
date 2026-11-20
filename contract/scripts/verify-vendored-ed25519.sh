@@ -14,8 +14,8 @@ if [ -n "$expected" ]; then
   echo "$expected  $tmp/crate.tar.gz" | sha256sum -c -
 fi
 tar -xzf "$tmp/crate.tar.gz" -C "$tmp"
-# .cargo_vcs_info.json / .cargo-checksum.json are packaging metadata only.
-if diff -r -x .cargo_vcs_info.json -x .cargo-checksum.json -x Cargo.toml.orig \
+# .cargo_vcs_info.json / .cargo-checksum.json / .cargo-ok are packaging metadata only.
+if diff -r -x .cargo_vcs_info.json -x .cargo-checksum.json -x .cargo-ok -x Cargo.toml.orig \
     "$tmp/ed25519-dalek-2.2.0" "$vendor"; then
   echo "vendor/ed25519-dalek-2.2.0 matches crates.io 2.2.0 (no patches)"
 else
