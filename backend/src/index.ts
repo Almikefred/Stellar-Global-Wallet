@@ -11,6 +11,8 @@ import { startRecoveryNotifier } from "./services/recoveryNotifier";
 import { getVerifiedAssets } from "./services/verifiedAssets";
 import { startTtlKeeper } from "./services/ttlKeeper";
 import { startUpgradeWatcher } from "./services/upgradeWatcher";
+import { startInvalidationListener } from "./services/sorobanCache";
+import { startActivityFeedIndexer } from "./services/activityFeed";
 
 async function main() {
   // #54 — fail fast on a malformed verified-asset list rather than on the
@@ -43,12 +45,21 @@ async function main() {
     console.error("[recovery-notifier] fatal error", err.message);
   });
 
+  // #86 — start cross-instance cache invalidation listener.
+  void startInvalidationListener().catch((err: Error) => {
+    console.error("[soroban-cache] failed to start invalidation listener", err.message);
+  });
+
+  // #79 — activity feed indexer for contract events
+  const stopActivityFeedIndexer = startActivityFeedIndexer(stellar);
+
   // #185 — keep active wallets' persistent entries from archiving.
   const stopTtlKeeper = startTtlKeeper();
   // #186 — announce proposed/executed contract upgrades.
   const stopUpgradeWatcher = startUpgradeWatcher();
 
   const shutdownGracefully = async (signal: string) => {
+    stopActivityFeedIndexer();
     stopTtlKeeper();
     stopUpgradeWatcher();
     console.log(`${signal} received, shutting down`);

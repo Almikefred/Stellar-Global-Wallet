@@ -9,11 +9,15 @@
  *
  * `recoveryNotifier` already polls this contract's events, so it passes these
  * on to `notifyAssetUntracked`. Dedup happens there, before this is called.
+ *
+ * Cache invalidation: after processing asset untracking events, bust the
+ * contract cache so subsequent reads reflect the new on-chain state.
  */
 
 import { getDevicesForAccounts } from "./deviceRegistry";
 import { sendPushToAll } from "./pushSender";
 import { tNotification } from "./i18nHelper";
+import { bustContractCache } from "./sorobanCache";
 
 export interface AssetUntrackedEvent {
   user: string;
@@ -83,5 +87,15 @@ export async function notifyAssetUntracked(
       limit: parsed.limit,
     },
   });
+
+  // Cache invalidation: bust the contract cache when detecting state-mutating
+  // migration events so subsequent reads reflect the new on-chain state.
+  bustContractCache(meta.contractId).catch((err: Error) => {
+    console.error(
+      `[asset-migration-notifier] failed to bust cache for ${meta.contractId}`,
+      err.message
+    );
+  });
+
   return devices.length;
 }

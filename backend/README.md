@@ -112,3 +112,46 @@ use an exposed key to sign transactions and move the account's funds.
 
 The deprecation headers are additive. Authentication and validation behavior
 otherwise remain unchanged.
+
+## Activity Feed and Event Indexing
+
+The activity feed (`GET /api/v1/wallet/:publicKey/activity`) combines Horizon
+payment history with Soroban contract events. The backend indexes contract
+events to a durable PostgreSQL table with:
+
+- **Durable cursor persistence**: The indexer commits event IDs and cursor
+  position in the same database transaction, ensuring no event loss on crash.
+- **Retention gap detection**: When the indexer's cursor falls behind RPC's
+  ~7-day event retention window, it detects the gap and reconciles state.
+- **Idempotent event ingestion**: Events are upserted by ID to prevent
+  duplicates on restart or retry.
+- **Lag monitoring**: Alerts are logged when the indexer is more than 100
+  ledgers behind the current ledger.
+
+The indexer runs as a background worker and can be configured via:
+
+- `INDEXER_START_LEDGER`: Ledger to start indexing from (default: 0 = start from latest)
+- `INDEXER_POLL_INTERVAL_MS`: Poll frequency in milliseconds (default: 5000)
+- `INDEXER_PAGE_SIZE`: Max events per page (default: 200)
+
+## Cache Invalidation
+
+The Soroban cache (`#86`) provides 15-second TTL caching for read operations.
+To prevent stale data after state changes:
+
+- **Event-driven invalidation**: When the indexer detects state-mutating events
+  (guardian changes, recovery changes, migration events), it broadcasts
+  invalidation messages via Redis pub/sub to all backend instances.
+- **Cross-instance invalidation**: All instances subscribe to the invalidation
+  channel and invalidate their local caches when events occur.
+- **Read-your-writes**: After a transaction is submitted, reads for that user
+  bypass the cache until the transaction is confirmed, ensuring users see
+  the effect of their own changes immediately.
+
+Cache metrics are logged to stdout for integration with log aggregation tools
+(Datadog, CloudWatch, etc.).
+
+## Rate limits and idempotency
+
+Rate limits apply per account for write routes. The API supports idempotency
+keys for safe retries; see [`docs/idempotency-key-header.md`](./docs/idempotency-key-header.md).

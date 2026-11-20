@@ -27,6 +27,10 @@
  *
  * Deduplication: event IDs from Soroban RPC are stored in Redis (SET NX,
  * 48-hour TTL) so retries never re-deliver.
+ *
+ * Cache invalidation: after processing state-mutating events (guardian changes,
+ * recovery changes), bust the contract cache so subsequent reads reflect the
+ * new on-chain state immediately.
  */
 
 import { createClient } from "redis";
@@ -35,6 +39,7 @@ import { getDevicesForAccounts } from "./deviceRegistry";
 import { sendPushToAll } from "./pushSender";
 import { tNotification } from "./i18nHelper";
 import { isAssetUntrackedTopic, notifyAssetUntracked } from "./assetMigrationNotifier";
+import { bustContractCache } from "./sorobanCache";
 
 const DEDUP_KEY_PREFIX = "orbit-wal:notif-dedup:recovery:";
 const DEDUP_TTL_SECONDS = 48 * 60 * 60;
@@ -238,6 +243,17 @@ async function processEvent(event: SorobanEvent): Promise<void> {
   // Guardian notification — only on initiation (they need to approve).
   if (isRecoveryInitiated) {
     await notifyGuardians(event, ownerAddress);
+  }
+
+  // Cache invalidation: bust the contract cache when detecting state-mutating
+  // events so subsequent reads reflect the new on-chain state immediately.
+  if (isRecoveryInitiated || isRecoveryApproved || isGuardianEvent) {
+    bustContractCache(event.contractId).catch((err: Error) => {
+      console.error(
+        `[recovery-notifier] failed to bust cache for ${event.contractId}`,
+        err.message
+      );
+    });
   }
 }
 
