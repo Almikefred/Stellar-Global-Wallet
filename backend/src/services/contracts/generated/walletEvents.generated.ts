@@ -65,7 +65,6 @@ export const GENERATED_EVENT_SCHEMAS: Readonly<Record<string, GeneratedEventSche
     fields: [
       { name: "user", kind: "address" },
       { name: "token_id", kind: "address" },
-      { name: "asset_code", kind: "string" },
       { name: "to", kind: "address" },
       { name: "amount", kind: "i128" },
     ],
@@ -77,7 +76,7 @@ export const GENERATED_EVENT_SCHEMAS: Readonly<Record<string, GeneratedEventSche
     fields: [
       { name: "token_id", kind: "address" },
       { name: "asset_code", kind: "string" },
-      { name: "issuer_key", kind: "option<bytes>" },
+      { name: "issuer_key", kind: "unknown" },
       { name: "executed_by", kind: "address" },
     ],
   },
@@ -97,7 +96,7 @@ export const GENERATED_EVENT_SCHEMAS: Readonly<Record<string, GeneratedEventSche
     fields: [
       { name: "token_id", kind: "address" },
       { name: "asset_code", kind: "string" },
-      { name: "issuer_key", kind: "option<bytes>" },
+      { name: "issuer_key", kind: "unknown" },
       { name: "proposed_by", kind: "address" },
       { name: "ready_at", kind: "u32" },
     ],

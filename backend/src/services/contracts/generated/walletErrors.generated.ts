@@ -51,4 +51,11 @@ export const GENERATED_WALLET_ERRORS: readonly GeneratedWalletError[] = [
   { code: 1041, name: "AllowlistProposalNotFound", apiCode: "ALLOWLIST_PROPOSAL_NOT_FOUND" },
   { code: 1042, name: "AllowlistNotReady", apiCode: "ALLOWLIST_NOT_READY" },
   { code: 1043, name: "AllowlistAlreadyPending", apiCode: "ALLOWLIST_ALREADY_PENDING" },
+  { code: 1044, name: "SendsPaused", apiCode: "SENDS_PAUSED" },
+  { code: 1045, name: "SpendLimitArchived", apiCode: "SPEND_LIMIT_ARCHIVED" },
+  { code: 1046, name: "NoPendingSpendLimit", apiCode: "NO_PENDING_SPEND_LIMIT" },
+  { code: 1047, name: "GuardianChangePending", apiCode: "GUARDIAN_CHANGE_PENDING" },
+  { code: 1048, name: "NoPendingGuardianChange", apiCode: "NO_PENDING_GUARDIAN_CHANGE" },
+  { code: 1049, name: "GuardianChangeNotReady", apiCode: "GUARDIAN_CHANGE_NOT_READY" },
+  { code: 1050, name: "RecoveryCancelNotAllowed", apiCode: "RECOVERY_CANCEL_NOT_ALLOWED" },
 ];

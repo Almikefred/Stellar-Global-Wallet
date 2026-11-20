@@ -41,5 +41,12 @@
   "TokenNotStellarAsset": 1040,
   "AllowlistProposalNotFound": 1041,
   "AllowlistNotReady": 1042,
-  "AllowlistAlreadyPending": 1043
+  "AllowlistAlreadyPending": 1043,
+  "SendsPaused": 1044,
+  "SpendLimitArchived": 1045,
+  "NoPendingSpendLimit": 1046,
+  "GuardianChangePending": 1047,
+  "NoPendingGuardianChange": 1048,
+  "GuardianChangeNotReady": 1049,
+  "RecoveryCancelNotAllowed": 1050
 }
