@@ -5,6 +5,7 @@ import { ensureVerifiedEmailsTable } from "./services/emailVerification";
 import { ensurePreferencesTable } from "./routes/preferences";
 import { ensureBuiltTransactionsTable } from "./services/builtTransactions";
 import { ensureFeeSponsorshipTable } from "./services/feeSponsorship";
+import { ensureActivityFeedTable } from "./services/activityFeed";
 
 export const pool = new Pool({ connectionString: config.DATABASE_URL });
 
@@ -62,6 +63,9 @@ export async function ensureAuditTable() {
 
   // #195 — per-user fee-sponsorship budget tracking.
   await ensureFeeSponsorshipTable(pool);
+
+  // #79 — activity feed events and cursor table.
+  await ensureActivityFeedTable();
 }
 
 export async function ensurePendingTxsTable(db: Pool) {

@@ -11,10 +11,14 @@
  * Failure modes: RPC errors are logged and retried on the next poll; the
  * status reports `lastCheckedLedger` so a stalled watcher is visible. RPC
  * only retains ~7 days of events, comfortably longer than the poll gap.
+ *
+ * Cache invalidation: busts the contract cache after `upgrade_executed` events
+ * so subsequent reads reflect the new contract code immediately.
  */
 import * as StellarSdk from "@stellar/stellar-sdk";
 import { config } from "../config";
 import { createOpsAlertSink, OpsAlertSink } from "./opsAlerts";
+import { bustContractCache } from "./sorobanCache";
 
 const HISTORY_LIMIT = 20;
 const LEDGER_SECONDS = 5;
@@ -107,6 +111,14 @@ export class UpgradeWatcher {
         kind: "upgrade_executed",
         message: `Contract upgraded to wasm ${record.wasmHash}`,
         details: { contractId: this.deps.contractId, ...record },
+      });
+      // Cache invalidation: bust the contract cache when an upgrade executes
+      // so subsequent reads reflect the new contract code.
+      bustContractCache(this.deps.contractId).catch((err: Error) => {
+        console.error(
+          `[upgrade-watcher] failed to bust cache for ${this.deps.contractId}`,
+          err.message
+        );
       });
     }
   }

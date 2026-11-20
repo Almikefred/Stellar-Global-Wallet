@@ -6,7 +6,12 @@ import {
   SorobanTransactionError,
   SorobanUnavailableError,
 } from "./sorobanErrors";
-import { getCachedSimulate, setCachedSimulate } from "./sorobanCache";
+import {
+  getCachedSimulate,
+  setCachedSimulate,
+  markPendingTransaction,
+  clearPendingTransaction,
+} from "./sorobanCache";
 import { SourceAccountNotFoundError, TransactionExpiredError } from "./stellarErrors";
 import {
   assertNotExpired,
@@ -107,7 +112,7 @@ export class SorobanService {
     const argsKey = Buffer.from(args.map((a) => a.toXDR("base64")).join("|")).toString(
       "base64"
     );
-    const cached = await getCachedSimulate<T>(contractId, method, argsKey);
+    const cached = await getCachedSimulate<T>(contractId, method, argsKey, sourcePublicKey);
     if (cached !== null) return cached;
 
     // Simulation never checks the source's sequence number, so a read with
@@ -149,6 +154,11 @@ export class SorobanService {
   }): Promise<ContractCallResult<T>> {
     const { contractId, method, args, sourceSecretKey } = params;
     const keypair = StellarSdk.Keypair.fromSecret(sourceSecretKey);
+    const sourcePublicKey = keypair.publicKey();
+    
+    // Mark this user as having a pending transaction (read-your-writes)
+    await markPendingTransaction(sourcePublicKey);
+    
     let sourceAccount = await this.server.getAccount(keypair.publicKey());
     let tx = this.buildInvocation(sourceAccount, contractId, method, args);
 
@@ -159,6 +169,8 @@ export class SorobanService {
     // failed simulation.
     let sim = await this.server.simulateTransaction(tx);
     if (rpc.Api.isSimulationError(sim)) {
+      // Transaction failed before submission - clear the pending flag
+      await clearPendingTransaction(sourcePublicKey);
       throw new SorobanSimulationError(
         `Simulation failed for ${contractId}.${method}: ${sim.error}`,
         sim.error
@@ -173,6 +185,8 @@ export class SorobanService {
       tx = this.buildInvocation(sourceAccount, contractId, method, args);
       sim = await this.server.simulateTransaction(tx);
       if (rpc.Api.isSimulationError(sim)) {
+        // Transaction failed after restore - clear the pending flag
+        await clearPendingTransaction(sourcePublicKey);
         throw new SorobanSimulationError(
           `Simulation failed for ${contractId}.${method} after restore: ${sim.error}`,
           sim.error
@@ -185,6 +199,8 @@ export class SorobanService {
 
     const send = await this.server.sendTransaction(prepared);
     if (send.status === "ERROR") {
+      // Transaction rejected before ledger entry - clear the pending flag
+      await clearPendingTransaction(sourcePublicKey);
       throw new SorobanSimulationError(
         `${contractId}.${method} was rejected before entering the ledger (status: ${send.status})`,
         send.errorResult ? send.errorResult.toXDR("base64") : send.status
@@ -192,6 +208,10 @@ export class SorobanService {
     }
 
     const final = await this.pollTransaction(send.hash);
+    
+    // Clear the pending flag after transaction reaches final state
+    await clearPendingTransaction(sourcePublicKey);
+    
     if (final.status === rpc.Api.GetTransactionStatus.SUCCESS) {
       const result =
         final.returnValue !== undefined
@@ -358,21 +378,37 @@ export class SorobanService {
   async submitSigned(params: { signedXdr: string }): Promise<SubmitSignedResult | SubmitSignedPending> {
     const parsed = parseSignedTransaction(params.signedXdr, this.networkPassphrase);
     assertNotExpired(parsed.transaction);
+    
+    // Extract source public key for read-your-writes tracking
+    const sourcePublicKey = parsed.sourcePublicKey;
+    
+    // Mark this user as having a pending transaction (read-your-writes)
+    await markPendingTransaction(sourcePublicKey);
 
     let send: StellarSdk.rpc.Api.SendTransactionResponse;
     try {
       send = await this.server.sendTransaction(parsed.transaction);
     } catch {
+      // Clear pending flag if send fails
+      await clearPendingTransaction(sourcePublicKey);
       throw new SorobanUnavailableError();
     }
 
-    if (send.status === "ERROR") throw translateSendError(send, parsed.hash);
+    if (send.status === "ERROR") {
+      await clearPendingTransaction(sourcePublicKey);
+      throw translateSendError(send, parsed.hash);
+    }
     if (send.status === "TRY_AGAIN_LATER") {
+      await clearPendingTransaction(sourcePublicKey);
       throw new SorobanUnavailableError("Soroban RPC is busy. Try again shortly.");
     }
 
     // PENDING, or DUPLICATE (already queued by an earlier submit): wait for the outcome.
     const final = await this.pollTransaction(send.hash);
+    
+    // Clear the pending flag after transaction reaches final state
+    await clearPendingTransaction(sourcePublicKey);
+    
     if (final.status === rpc.Api.GetTransactionStatus.SUCCESS) {
       return { hash: send.hash, ledger: final.ledger, successful: true };
     }
