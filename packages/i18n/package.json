@@ -5,7 +5,8 @@
   "main": "src/index.ts",
   "types": "src/index.ts",
   "scripts": {
-    "i18n:check": "tsx scripts/check-missing-keys.ts"
+    "i18n:check": "tsx scripts/check-missing-keys.ts",
+    "test": "node --test --import tsx tests/format.test.ts"
   },
   "devDependencies": {
     "tsx": "^4.7.1",

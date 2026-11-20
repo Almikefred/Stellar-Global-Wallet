@@ -44,6 +44,7 @@ const REQUIRED_ERROR_KEYS: string[] = loadBackendErrorCodes();
 //   backend/src/services/paymentNotifier.ts
 //   backend/src/services/recoveryNotifier.ts
 //   backend/src/services/emailNotifier.ts
+//   backend/src/services/assetMigrationNotifier.ts
 const REQUIRED_NOTIFICATION_KEYS: string[] = [
   "payment.received.title",
   "payment.received.body",
@@ -63,6 +64,9 @@ const REQUIRED_NOTIFICATION_KEYS: string[] = [
   "email.recovery_initiated.body",
   "email.large_send.subject",
   "email.large_send.body",
+  "migration.asset_untracked.title",
+  "migration.asset_untracked.body",
+  "migration.asset_untracked.body_limited",
 ];
 
 function check(
@@ -83,7 +87,21 @@ const missingNotifications = check(
   REQUIRED_NOTIFICATION_KEYS
 );
 
+// Unused keys: catalogue entries nothing requires any more (dead copy).
+const unused = [
+  ...Object.keys(errorsEn).filter((k) => !REQUIRED_ERROR_KEYS.includes(k)).map((k) => `errors/en.json: ${k}`),
+  ...Object.keys(notificationsEn)
+    .filter((k) => !REQUIRED_NOTIFICATION_KEYS.includes(k))
+    .map((k) => `notifications/en.json: ${k}`),
+];
+
 let failed = false;
+
+if (unused.length > 0) {
+  console.error("❌  Unused catalogue keys (remove them or reference them):");
+  unused.forEach((k) => console.error(`   - ${k}`));
+  failed = true;
+}
 
 if (missingErrors.length > 0) {
   console.error("❌  Missing keys in errors/en.json:");
