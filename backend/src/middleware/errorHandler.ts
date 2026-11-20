@@ -7,6 +7,7 @@ import {
   isErrorCode,
 } from "../errors/appError";
 import { SorobanTransactionError } from "../services/sorobanErrors";
+import { getActiveTraceId } from "../telemetry";
 
 /**
  * Pre-existing gap found while wiring up the per-route JSON body limits
@@ -76,7 +77,7 @@ function toAppError(error: unknown): AppError {
  * middleware (falling back to the request header) so clients can correlate
  * a failure with server logs. Stack traces are never included.
  */
-function toErrorBody(error: AppError, requestId?: string) {
+function toErrorBody(error: AppError, requestId?: string, traceId?: string) {
   const inner: Record<string, unknown> = {
     code: error.code,
     message: error.message,
@@ -98,6 +99,10 @@ function toErrorBody(error: AppError, requestId?: string) {
     inner.requestId = requestId;
   }
 
+  if (traceId) {
+    inner.traceId = traceId;
+  }
+
   return { error: inner };
 }
 
@@ -112,6 +117,20 @@ function resolveRequestId(req: Request, res: Response): string | undefined {
   return fromRequest && fromRequest.length > 0 ? fromRequest : undefined;
 }
 
+function resolveTraceId(req: Request, res: Response): string | undefined {
+  const activeTrace = getActiveTraceId();
+  if (activeTrace) return activeTrace;
+  if (req.traceId) return req.traceId;
+  const fromResponse =
+    typeof res.getHeader === "function" ? res.getHeader("x-trace-id") : undefined;
+  if (typeof fromResponse === "string" && fromResponse.length > 0) {
+    return fromResponse;
+  }
+  const fromRequest =
+    typeof req.header === "function" ? req.header("x-trace-id") : undefined;
+  return typeof fromRequest === "string" && fromRequest.length > 0 ? fromRequest : undefined;
+}
+
 export function errorHandler(
   err: unknown,
   req: Request,
@@ -121,5 +140,6 @@ export function errorHandler(
   console.error(err);
   const error = toAppError(err);
   const requestId = resolveRequestId(req, res);
-  res.status(error.status).json(toErrorBody(error, requestId));
+  const traceId = resolveTraceId(req, res);
+  res.status(error.status).json(toErrorBody(error, requestId, traceId));
 }

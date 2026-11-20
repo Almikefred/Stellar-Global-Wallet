@@ -9,6 +9,7 @@ import { isGAddress, publicKeyMessage } from "../utils/stellarAddress";
 import { toStroops } from "../utils/stroops";
 import { isValidAccountId } from "../validation/historyQuery";
 import { getUpgradeWatcherStatus } from "../services/upgradeWatcher";
+import { shutdownManager } from "../services/shutdown";
 
 /** Largest value a Soroban i128 can hold. */
 const I128_MAX = 2n ** 127n - 1n;
@@ -467,7 +468,9 @@ export function createContractRouter(globeWallet: GlobeWalletContract): Router {
     async (req, res, next) => {
       try {
         assertValidRequest(req);
-        const result = await globeWallet.submitSigned(req.body.signedXdr);
+        const result = await shutdownManager.trackSubmission(() =>
+          globeWallet.submitSigned(req.body.signedXdr)
+        );
         res.status("status" in result ? 202 : 200).json(result);
       } catch (err) {
         next(err);

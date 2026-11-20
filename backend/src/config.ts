@@ -62,6 +62,9 @@ const corsOriginRegexSchema = z
 
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
+  // Graceful shutdown timeout in milliseconds (#220).
+  // Time allotted to finish in-flight requests, drain submissions, and release locks.
+  SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().positive().default(25000),
   PORT: z.coerce.number().int().positive().default(4000),
   HORIZON_URL: z.string().url().default("https://horizon-testnet.stellar.org"),
   NETWORK_PASSPHRASE: z.string().min(1),

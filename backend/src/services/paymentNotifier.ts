@@ -25,7 +25,7 @@ import { getDevicesForAccounts } from "./deviceRegistry";
 import { sendPushToAll } from "./pushSender";
 import { tNotification } from "./i18nHelper";
 
-const DEDUP_KEY_PREFIX = "orbit-wal:notif-dedup:payment:";
+const DEDUP_KEY_PREFIX = `orbit-wal:${config.STELLAR_NETWORK}:notif-dedup:payment:`;
 const DEDUP_TTL_SECONDS = 48 * 60 * 60; // 48 h
 // Horizon streams take cursor='now' to receive only future events.
 const STREAM_CURSOR = "now";

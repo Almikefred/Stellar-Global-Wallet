@@ -94,9 +94,46 @@ export class Histogram {
   }
 }
 
-const registry: Array<Counter | Histogram> = [];
+export class Gauge {
+  private readonly values = new Map<string, number>();
 
-function register<T extends Counter | Histogram>(metric: T): T {
+  constructor(readonly name: string, readonly help: string) {}
+
+  set(value: number, labels: Labels = {}): void {
+    const key = labelKey(labels);
+    this.values.set(key, value);
+  }
+
+  inc(labels: Labels = {}, by = 1): void {
+    const key = labelKey(labels);
+    this.values.set(key, (this.values.get(key) ?? 0) + by);
+  }
+
+  dec(labels: Labels = {}, by = 1): void {
+    const key = labelKey(labels);
+    this.values.set(key, (this.values.get(key) ?? 0) - by);
+  }
+
+  get(labels: Labels = {}): number {
+    return this.values.get(labelKey(labels)) ?? 0;
+  }
+
+  reset(): void {
+    this.values.clear();
+  }
+
+  render(): string[] {
+    const lines = [`# HELP ${this.name} ${this.help}`, `# TYPE ${this.name} gauge`];
+    for (const [key, value] of this.values) {
+      lines.push(`${this.name}${key ? `{${key}}` : ""} ${value}`);
+    }
+    return lines;
+  }
+}
+
+const registry: Array<Counter | Histogram | Gauge> = [];
+
+function register<T extends Counter | Histogram | Gauge>(metric: T): T {
   registry.push(metric);
   return metric;
 }
@@ -116,6 +153,39 @@ export const metrics = {
   lockLeaseLost: register(new Counter("account_lock_lease_lost_total", "Lease extensions refused by the lock backend")),
   /** #196 — sponsored-reserve onboarding and reclamation. */
   sponsorships: register(new Counter("sponsored_reserves_total", "Sponsored reserve events, by event and kind")),
+
+  /** #222 — Total transaction submissions by route and outcome (success, failure, pending). */
+  submissionsTotal: register(
+    new Counter("wallet_submissions_total", "Total transaction submissions by route and status")
+  ),
+  /** #222 — Duration of wallet submissions in milliseconds. */
+  submissionDurationMs: register(
+    new Histogram(
+      "wallet_submission_duration_ms",
+      "Transaction submission duration in milliseconds",
+      [50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000]
+    )
+  ),
+  /** #222 — Total inbound HTTP requests by method, route, and status. */
+  httpRequestsTotal: register(
+    new Counter("http_requests_total", "Total HTTP requests by method, route, and status")
+  ),
+  /** #222 — Inbound HTTP request duration in milliseconds. */
+  httpRequestDurationMs: register(
+    new Histogram(
+      "http_request_duration_ms",
+      "HTTP request latency in milliseconds",
+      [5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000]
+    )
+  ),
+  /** #222 — Activity feed indexer lag behind chain tip in ledgers. */
+  indexerLagLedgers: register(
+    new Gauge("activity_feed_indexer_lag_ledgers", "Activity feed indexer lag behind chain tip in ledgers")
+  ),
+  /** #222 — Activity feed indexer highest indexed ledger. */
+  indexerCurrentLedger: register(
+    new Gauge("activity_feed_indexer_current_ledger", "Activity feed indexer highest indexed ledger")
+  ),
 };
 
 export function renderMetrics(): string {

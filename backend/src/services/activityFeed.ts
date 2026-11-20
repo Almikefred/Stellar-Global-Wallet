@@ -2,6 +2,7 @@ import * as StellarSdk from "@stellar/stellar-sdk";
 import { config } from "../config";
 import { StellarService } from "./stellar";
 import { pool } from "./db";
+import { metrics } from "./metrics";
 
 export interface UnifiedActivityItem {
   id: string;
@@ -398,6 +399,8 @@ export async function startActivityFeedIndexer(stellar: StellarService): Promise
       // Update metrics
       const currentLedger = await server.getLatestLedger();
       const gap = currentLedger.sequence - result.lastLedger;
+      metrics.indexerLagLedgers.set(gap, { contract: contractId });
+      metrics.indexerCurrentLedger.set(result.lastLedger, { contract: contractId });
 
       // Log lag metrics
       console.log(

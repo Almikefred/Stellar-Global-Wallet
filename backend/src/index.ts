@@ -13,8 +13,23 @@ import { startTtlKeeper } from "./services/ttlKeeper";
 import { startUpgradeWatcher } from "./services/upgradeWatcher";
 import { startInvalidationListener } from "./services/sorobanCache";
 import { startActivityFeedIndexer } from "./services/activityFeed";
+import { shutdownManager } from "./services/shutdown";
+import { assertNetworkConfigurationMatches } from "./utils/networkCheck";
 
 async function main() {
+  // #223 — Multi-network safety: verify Horizon and Soroban RPC endpoints match config
+  if (config.NODE_ENV !== "test") {
+    try {
+      const netInfo = await assertNetworkConfigurationMatches();
+      console.log(
+        `[network-check] Verified network matches ${netInfo.expectedNetwork} ("${netInfo.horizonPassphrase}")`
+      );
+    } catch (err) {
+      console.error("[network-check] Fatal network mismatch error:", (err as Error).message);
+      process.exit(1);
+    }
+  }
+
   // #54 — fail fast on a malformed verified-asset list rather than on the
   // first request that needs it.
   getVerifiedAssets();
@@ -59,13 +74,27 @@ async function main() {
   const stopUpgradeWatcher = startUpgradeWatcher();
 
   const shutdownGracefully = async (signal: string) => {
-    stopActivityFeedIndexer();
-    stopTtlKeeper();
-    stopUpgradeWatcher();
-    console.log(`${signal} received, shutting down`);
-    server.close(async () => {
-      await shutdown();
-      process.exit(0);
+    console.log(`[shutdown] ${signal} received, beginning graceful shutdown`);
+    await shutdownManager.initiateShutdown(server, {
+      timeoutMs: config.SHUTDOWN_TIMEOUT_MS,
+      onDrainStart: () => {
+        stopActivityFeedIndexer();
+        stopTtlKeeper();
+        stopUpgradeWatcher();
+      },
+      onDrainComplete: async () => {
+        try {
+          await shutdown();
+        } catch (err) {
+          console.error("[shutdown] Error releasing account locks:", err);
+        }
+        try {
+          await pool.end();
+        } catch (err) {
+          console.error("[shutdown] Error closing database pool:", err);
+        }
+        process.exit(0);
+      },
     });
   };
 

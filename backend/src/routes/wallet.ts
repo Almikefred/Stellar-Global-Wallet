@@ -30,6 +30,7 @@ import {
   releaseIdempotencyKey,
   requestFingerprint,
 } from "../services/idempotency";
+import { shutdownManager } from "../services/shutdown";
 import { createClientSigningRouter } from "./clientSigning";
 
 const SEP7_PAY_PREFIX = "web+stellar:pay?";
@@ -714,7 +715,9 @@ export function createWalletRouter(stellar: StellarService): Router {
     body("idempotencyKey").optional().isString().isLength({ max: 255 }),
     (req, res, next) => {
       const firstSigner = Array.isArray(req.body.signerSecretKeys) ? req.body.signerSecretKeys[0] : undefined;
-      handleIdempotentRequest(req, res, next, firstSigner, () => stellar.submitWithAdditionalSignatures(req.body));
+      handleIdempotentRequest(req, res, next, firstSigner, () =>
+        shutdownManager.trackSubmission(() => stellar.submitWithAdditionalSignatures(req.body))
+      );
     }
   );
 

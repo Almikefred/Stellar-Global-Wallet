@@ -22,6 +22,8 @@ import {
   SubmitSignedResult,
   UnsignedTransactionInfo,
 } from "./transactionEnvelope";
+import { withSpan } from "../telemetry";
+import { metrics } from "./metrics";
 
 const { rpc } = StellarSdk;
 
@@ -385,39 +387,58 @@ export class SorobanService {
     // Mark this user as having a pending transaction (read-your-writes)
     await markPendingTransaction(sourcePublicKey);
 
+    const startTime = Date.now();
     let send: StellarSdk.rpc.Api.SendTransactionResponse;
     try {
-      send = await this.server.sendTransaction(parsed.transaction);
-    } catch {
+      send = await withSpan(
+        "soroban_rpc.send_transaction",
+        {
+          "rpc.system": "soroban_rpc",
+          "stellar.network": this.networkPassphrase,
+          "stellar.tx_hash": parsed.hash,
+        },
+        () => this.server.sendTransaction(parsed.transaction)
+      );
+    } catch (err) {
+      metrics.submissionsTotal.inc({ status: "failed", route: "contract_submit" });
+      metrics.submissionDurationMs.observe(Date.now() - startTime);
       // Clear pending flag if send fails
       await clearPendingTransaction(sourcePublicKey);
       throw new SorobanUnavailableError();
     }
 
     if (send.status === "ERROR") {
+      metrics.submissionsTotal.inc({ status: "failed", route: "contract_submit" });
+      metrics.submissionDurationMs.observe(Date.now() - startTime);
       await clearPendingTransaction(sourcePublicKey);
       throw translateSendError(send, parsed.hash);
     }
     if (send.status === "TRY_AGAIN_LATER") {
+      metrics.submissionsTotal.inc({ status: "pending", route: "contract_submit" });
+      metrics.submissionDurationMs.observe(Date.now() - startTime);
       await clearPendingTransaction(sourcePublicKey);
       throw new SorobanUnavailableError("Soroban RPC is busy. Try again shortly.");
     }
 
     // PENDING, or DUPLICATE (already queued by an earlier submit): wait for the outcome.
     const final = await this.pollTransaction(send.hash);
+    metrics.submissionDurationMs.observe(Date.now() - startTime);
     
     // Clear the pending flag after transaction reaches final state
     await clearPendingTransaction(sourcePublicKey);
     
     if (final.status === rpc.Api.GetTransactionStatus.SUCCESS) {
+      metrics.submissionsTotal.inc({ status: "success", route: "contract_submit" });
       return { hash: send.hash, ledger: final.ledger, successful: true };
     }
     if (final.status === rpc.Api.GetTransactionStatus.FAILED) {
+      metrics.submissionsTotal.inc({ status: "failed", route: "contract_submit" });
       throw new SorobanTransactionError(
         `Transaction failed on-chain after passing simulation (hash ${send.hash})`,
         send.hash
       );
     }
+    metrics.submissionsTotal.inc({ status: "pending", route: "contract_submit" });
     return { hash: send.hash, status: "pending" };
   }
 

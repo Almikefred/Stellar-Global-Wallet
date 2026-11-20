@@ -40,7 +40,8 @@ export async function ensureAuditTable() {
   await pool.query(`
     ALTER TABLE idempotency_keys
       ADD COLUMN IF NOT EXISTS request_fingerprint VARCHAR(64) NOT NULL DEFAULT '',
-      ADD COLUMN IF NOT EXISTS committed BOOLEAN NOT NULL DEFAULT false
+      ADD COLUMN IF NOT EXISTS committed BOOLEAN NOT NULL DEFAULT false,
+      ADD COLUMN IF NOT EXISTS network VARCHAR(16) NOT NULL DEFAULT '${config.STELLAR_NETWORK}'
   `);
 
   // #87 — device token table for push notifications.
@@ -79,9 +80,15 @@ export async function ensurePendingTxsTable(db: Pool) {
       created_by VARCHAR(56) NOT NULL,
       expires_at TIMESTAMPTZ,
       status VARCHAR(16) NOT NULL DEFAULT 'pending',
+      network VARCHAR(16) NOT NULL DEFAULT '${config.STELLAR_NETWORK}',
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
+  `);
+
+  await db.query(`
+    ALTER TABLE pending_txs
+      ADD COLUMN IF NOT EXISTS network VARCHAR(16) NOT NULL DEFAULT '${config.STELLAR_NETWORK}'
   `);
 
   await db.query(`

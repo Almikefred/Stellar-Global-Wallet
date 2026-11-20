@@ -8,7 +8,7 @@
 import { createClient, RedisClientType } from "redis";
 import { config } from "../config";
 
-const KEY_PREFIX = "orbit-wal:json-cache:";
+const KEY_PREFIX = `orbit-wal:${config.STELLAR_NETWORK}:json-cache:`;
 
 type CacheClient = ReturnType<typeof createClient>;
 

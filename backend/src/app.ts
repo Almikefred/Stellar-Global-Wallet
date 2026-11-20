@@ -26,7 +26,9 @@ import { localeMiddleware } from "./middleware/locale";
 import { errorHandler } from "./middleware/errorHandler";
 import { requireLoginApiKey } from "./middleware/loginApiKey";
 import { config } from "./config";
-import { renderMetrics } from "./services/metrics";
+import { metrics, renderMetrics } from "./services/metrics";
+import { shutdownManager } from "./services/shutdown";
+import { telemetryMiddleware } from "./telemetry";
 import { StellarService } from "./services/stellar";
 import { SorobanService } from "./services/soroban";
 import { GlobeWalletContract } from "./services/contracts/globeWallet";
@@ -240,6 +242,22 @@ export function createApp(
     corsOrigins.push(config.CORS_ORIGIN_REGEX);
   }
   app.use(cors({ origin: corsOrigins, credentials: true }));
+  // #220 — reject incoming requests with 503 while shutting down, track in-flight requests
+  app.use(shutdownManager.requestTrackerMiddleware);
+  // #221 — OpenTelemetry trace context and request spans
+  app.use(telemetryMiddleware);
+  // #222 — HTTP request counter and latency histogram for SLOs
+  app.use((req, res, next) => {
+    const start = Date.now();
+    res.on("finish", () => {
+      const duration = Date.now() - start;
+      const route = req.route?.path ? String(req.route.path) : (req.baseUrl || req.path);
+      const status = String(res.statusCode);
+      metrics.httpRequestsTotal.inc({ method: req.method, route, status });
+      metrics.httpRequestDurationMs.observe(duration, { method: req.method, route, status });
+    });
+    next();
+  });
   app.use(morgan("combined"));
 
   // A multi-signed transaction envelope (several signatures on one XDR
@@ -393,11 +411,12 @@ export function createApp(
     }
   });
 
-  // #194/#197 — Prometheus text metrics: lock wait/contention, refused
-  // submissions, sponsored reserves. Counters only, no account data.
-  app.get("/api/v1/health/metrics", (_req, res) => {
+  // #194/#197/#222 — Prometheus text metrics endpoint: exposed at root /metrics and /api/v1/health/metrics
+  const handleMetrics = (_req: express.Request, res: express.Response) => {
     res.type("text/plain; version=0.0.4").send(renderMetrics());
-  });
+  };
+  app.get("/metrics", handleMetrics);
+  app.get("/api/v1/health/metrics", handleMetrics);
 
   // Unversioned and unauthenticated: this is where a browser enforcing
   // the Content-Security-Policy documented in docs/security/csp.md sends

@@ -84,5 +84,19 @@ export function createNetworkRouter(fetchFeeStats: FeeStatsFetcher = horizonFeeS
     res.json(fees);
   });
 
+  /**
+   * GET /api/v1/network/info (#223): Current network identity, passphrase, and endpoints.
+   */
+  router.get("/info", (_req, res) => {
+    res.set("Cache-Control", "public, max-age=60");
+    res.json({
+      network: config.STELLAR_NETWORK,
+      networkPassphrase: config.NETWORK_PASSPHRASE,
+      sorobanNetworkPassphrase: config.SOROBAN_NETWORK_PASSPHRASE,
+      horizonUrl: config.HORIZON_URL,
+      sorobanRpcUrl: config.SOROBAN_RPC_URL,
+    });
+  });
+
   return router;
 }
