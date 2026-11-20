@@ -8,6 +8,7 @@
   "SEQUENCE_CONFLICT": "A sequence conflict occurred. Please retry the transaction.",
   "MEMO_REQUIRED": "This destination requires a memo. Please include one.",
   "LOCK_TIMEOUT": "The account lock timed out. Please retry your request.",
+  "LOCK_UNAVAILABLE": "Account locking is temporarily unavailable. Please try again shortly.",
   "HORIZON_REJECTED": "The transaction was rejected by the Stellar network.",
   "SOROBAN_NOT_CONFIGURED": "The smart contract integration is not yet configured.",
   "SOROBAN_SIMULATION_FAILED": "The transaction simulation failed. Check your inputs.",
@@ -87,5 +88,8 @@
   "FEDERATION_NOT_FOUND": "We couldn't find that Stellar address.",
   "FEDERATION_TIMEOUT": "Looking up that address took too long. Please try again.",
   "FEDERATION_UNAVAILABLE": "We couldn't reach that address's server. Please try again.",
-  "PRICE_HISTORY_UNAVAILABLE": "Price history is temporarily unavailable."
+  "PRICE_HISTORY_UNAVAILABLE": "Price history is temporarily unavailable.",
+  "FEE_SPONSOR_NOT_CONFIGURED": "Fee sponsorship is not available right now.",
+  "FEE_SPONSOR_BUDGET_EXCEEDED": "Today's fee sponsorship limit has been reached. Please try again tomorrow.",
+  "FEE_SPONSOR_INELIGIBLE": "This account isn't eligible for fee sponsorship."
 }
