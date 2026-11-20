@@ -136,12 +136,31 @@ fn emit_event<D: IntoVal<Env, Val>>(env: &Env, name: &str, data: D) {
 /// Verified Stellar Asset Contract identity stored with each allowlisted
 /// token (issue #189). `issuer_key` is the raw ed25519 issuer public key,
 /// `None` for native XLM.
+/// Issuer of an allowlisted Stellar asset. A plain `Option<BytesN<32>>`
+/// field does not convert to `ScVal` under soroban-sdk 21 testutils, so the
+/// "no issuer" case (native XLM) is spelled out instead.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum IssuerKey {
+    Native,
+    Key(BytesN<32>),
+}
+
+impl From<Option<BytesN<32>>> for IssuerKey {
+    fn from(key: Option<BytesN<32>>) -> Self {
+        match key {
+            Some(k) => IssuerKey::Key(k),
+            None => IssuerKey::Native,
+        }
+    }
+}
+
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct AllowedTokenInfo {
     pub token_id: Address,
     pub asset_code: String,
-    pub issuer_key: Option<BytesN<32>>,
+    pub issuer_key: IssuerKey,
 }
 
 /// A timelocked allowlist addition (issue #189).
@@ -159,7 +178,7 @@ pub struct PendingAllowedToken {
 pub struct TokenAllowlistProposedEvent {
     pub token_id: Address,
     pub asset_code: String,
-    pub issuer_key: Option<BytesN<32>>,
+    pub issuer_key: IssuerKey,
     pub proposed_by: Address,
     pub ready_at: u32,
 }
@@ -170,7 +189,7 @@ pub struct TokenAllowlistProposedEvent {
 pub struct TokenAllowedEvent {
     pub token_id: Address,
     pub asset_code: String,
-    pub issuer_key: Option<BytesN<32>>,
+    pub issuer_key: IssuerKey,
     pub executed_by: Address,
 }
 
@@ -2122,7 +2141,7 @@ impl GlobeWallet {
             info: AllowedTokenInfo {
                 token_id: token_id.clone(),
                 asset_code: asset_code.clone(),
-                issuer_key: issuer_key.clone(),
+                issuer_key: issuer_key.clone().into(),
             },
             proposed_by: caller.clone(),
             ready_at,
@@ -2139,7 +2158,7 @@ impl GlobeWallet {
             TokenAllowlistProposedEvent {
                 token_id,
                 asset_code,
-                issuer_key,
+                issuer_key: issuer_key.into(),
                 proposed_by: caller,
                 ready_at,
             },
@@ -5448,7 +5467,7 @@ mod tests {
         let info = client.allowed_token_info(&token_id).unwrap();
         assert_eq!(info.token_id, token_id);
         assert_eq!(info.asset_code, String::from_str(&env, TEST_SAC_CODE));
-        assert_eq!(info.issuer_key, Some(key));
+        assert_eq!(info.issuer_key, IssuerKey::Key(key));
         let (topics, data) = find_event(&env, "token_allowed").expect("token_allowed");
         assert_eq!(u32::try_from_val(&env, &topics.get(1).unwrap()).unwrap(), EVENT_VERSION);
         let ev = TokenAllowedEvent::try_from_val(&env, &data).unwrap();
