@@ -20,7 +20,7 @@
 //! (issue #179), and migrations never delete limits (issue #178).
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, Address, Bytes, BytesN, Env, IntoVal, Map,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, Address, Bytes, BytesN, Env, IntoVal, Map,
     String, Symbol, Val, Vec,
 };
 use token_wrapper::TokenWrapperClient;
@@ -71,6 +71,26 @@ pub enum DataKey {
     RoleMember(Role, Address),
     /// Emergency pause flag for `send` (issue #190, `Role::Pauser`).
     Paused,
+    // Appended (never reordered) so every key above keeps its encoding.
+    Pauser,
+    SendsPaused,
+    /// (user, token) → marker that a non-zero limit was set (issue #185),
+    /// so an archived limit fails safe instead of reading as "unlimited".
+    LimitOptIn(Address, Address),
+    /// (user, token) → rolling 24h spend window (issue #177).
+    SpendWindow(Address, Address),
+    /// (user, token) → daily cap (issue #173).
+    TokenSpendLimit(Address, Address),
+    /// (user, token) → legacy fixed-day spend record (issue #173).
+    TokenDailySpent(Address, Address),
+    /// (user, token) → limit increase waiting out its delay (issue #173).
+    PendingSpendLimit(Address, Address),
+    PendingGuardianChange,
+    // ── Storage layout v2 (issue #184) ──
+    GuardianSet,
+    GuardianFlag(Address),
+    PendingRecovery,
+    StorageLayout,
 }
 
 // ── Roles (issue #190) ────────────────────────────────────────────────────────
@@ -202,7 +222,6 @@ pub struct PauseChangedEvent {
 pub struct SendExecutedEvent {
     pub user: Address,
     pub token_id: Address,
-    pub asset_code: String,
     pub to: Address,
     pub amount: i128,
 }
@@ -251,6 +270,10 @@ const PERSISTENT_TTL_EXTEND_TO: u32 = LEDGERS_PER_DAY * 30; // ~30 days
 /// (~1 year).
 const OPT_IN_TTL_THRESHOLD: u32 = LEDGERS_PER_DAY * 30;
 const OPT_IN_TTL_EXTEND_TO: u32 = LEDGERS_PER_DAY * 180;
+
+/// How long a spend-limit increase (or switch to unlimited) waits before it
+/// takes effect (issue #173). Decreases apply immediately.
+pub const SPEND_LIMIT_INCREASE_DELAY_SECS: u64 = SECONDS_PER_DAY;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -515,6 +538,13 @@ pub enum WalletError {
     /// A proposal for this token is already pending, or the token is
     /// already allowlisted (issue #189).
     AllowlistAlreadyPending = 1043,
+    SendsPaused = 1044,
+    SpendLimitArchived = 1045,
+    NoPendingSpendLimit = 1046,
+    GuardianChangePending = 1047,
+    NoPendingGuardianChange = 1048,
+    GuardianChangeNotReady = 1049,
+    RecoveryCancelNotAllowed = 1050,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -849,13 +879,10 @@ impl GlobeWallet {
         Self::require_no_pending_recovery(&env)?;
         Self::validate_guardian_add(&env, &guardian)?;
         Self::bump_instance_ttl(&env);
-        guardians.push_back(guardian.clone());
-        env.storage().instance().set(&DataKey::Guardians, &guardians);
-        membership.set(guardian.clone(), true);
-        env.storage()
-            .instance()
-            .set(&DataKey::GuardianMembership, &membership);
-        emit_event(&env, "guardian_added", guardian);
+        match Self::recovery_config(env.clone()) {
+            None => Self::apply_guardian_add(&env, guardian),
+            Some(config) => Self::queue_guardian_change(&env, guardian, true, config.delay_in_ledgers)?,
+        }
         Ok(())
     }
 
@@ -950,11 +977,16 @@ impl GlobeWallet {
         env.storage().instance().get(&DataKey::PendingGuardianChange)
     }
 
+    /// The guardian set is frozen while a recovery proposal exists (#175).
+    fn require_no_pending_recovery(env: &Env) -> Result<(), WalletError> {
+        if Self::recovery_proposal(env.clone()).is_some() {
+            return Err(WalletError::RecoveryAlreadyPending);
+        }
+        Ok(())
+    }
+
     fn validate_guardian_add(env: &Env, guardian: &Address) -> Result<(), WalletError> {
-        if Self::guardian_membership(env.clone())
-            .get(guardian.clone())
-            .unwrap_or(false)
-        {
+        if Self::is_guardian(env, guardian) {
             return Err(WalletError::GuardianAlreadyAdded);
         }
         if Self::guardians(env.clone()).len() >= Self::MAX_GUARDIANS {
@@ -964,10 +996,7 @@ impl GlobeWallet {
     }
 
     fn validate_guardian_remove(env: &Env, guardian: &Address) -> Result<(), WalletError> {
-        if !Self::guardian_membership(env.clone())
-            .get(guardian.clone())
-            .unwrap_or(false)
-        {
+        if !Self::is_guardian(env, guardian) {
             return Err(WalletError::GuardianNotFound);
         }
         if let Some(config) = Self::recovery_config(env.clone()) {
@@ -1004,50 +1033,31 @@ impl GlobeWallet {
     }
 
     fn apply_guardian_add(env: &Env, guardian: Address) {
+        Self::ensure_storage_layout(env);
         let mut guardians = Self::guardians(env.clone());
         guardians.push_back(guardian.clone());
-        env.storage().instance().set(&DataKey::Guardians, &guardians);
-        let mut membership = Self::guardian_membership(env.clone());
-        membership.set(guardian.clone(), true);
-        env.storage()
-            .instance()
-            .set(&DataKey::GuardianMembership, &membership);
-        env.events()
-            .publish((Symbol::new(env, "guardian_added"),), guardian);
+        Self::store_guardians(env, &guardians);
+        Self::set_guardian_flag(env, &guardian);
+        emit_event(env, "guardian_added", guardian);
     }
 
-        // Strip a stale approval from any pending recovery proposal so a
-        // just-removed guardian's earlier vote can no longer count toward
-        // quorum. See the doc comment above and issue #26 for the full
-        // rationale and the attack this closes.
-        if let Some(mut proposal) = Self::recovery_proposal(env.clone()) {
-            let mut new_approvals: Vec<Address> = Vec::new(&env);
-            let mut had_approval = false;
-            for i in 0..proposal.approvals.len() {
-                let a = proposal.approvals.get(i).unwrap();
-                if a == guardian {
-                    had_approval = true;
-                } else {
-                    new_approvals.push_back(a);
-                }
-            }
-            if had_approval {
-                proposal.approvals = new_approvals;
-                if let Some(config) = &recovery_config {
-                    if proposal.approvals.len() < config.threshold {
-                        proposal.ready_at = None;
-                    }
-                }
-                env.storage()
-                    .instance()
-                    .set(&DataKey::RecoveryProposal, &proposal);
-                emit_event(&env, "recovery_approval_invalidated", guardian.clone(),
-                );
+    /// The guardian set is frozen while a recovery is pending (issue #175),
+    /// so there is never an in-flight proposal whose approvals need pruning.
+    fn apply_guardian_remove(env: &Env, guardian: Address) {
+        Self::ensure_storage_layout(env);
+        let guardians = Self::guardians(env.clone());
+        let mut new_guardians: Vec<Address> = Vec::new(env);
+        for i in 0..guardians.len() {
+            let g = guardians.get(i).unwrap();
+            if g != guardian {
+                new_guardians.push_back(g);
             }
         }
-
-        emit_event(&env, "guardian_removed", guardian);
-        Ok(())
+        Self::store_guardians(env, &new_guardians);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::GuardianFlag(guardian.clone()));
+        emit_event(env, "guardian_removed", guardian);
     }
 
     /// Return the current guardian set.
@@ -1181,9 +1191,8 @@ impl GlobeWallet {
             approvals,
             ready_at: None,
         };
-        env.storage()
-            .instance()
-            .set(&DataKey::RecoveryProposal, &proposal);
+        Self::ensure_storage_layout(&env);
+        Self::store_proposal(&env, &proposal);
         emit_event(&env, "recovery_initiated", (guardian, new_admin),
         );
         Ok(())
@@ -1214,9 +1223,8 @@ impl GlobeWallet {
             emit_event(&env, "recovery_quorum_reached", (proposal.new_admin.clone(), ready_at),
             );
         }
-        env.storage()
-            .instance()
-            .set(&DataKey::RecoveryProposal, &proposal);
+        Self::ensure_storage_layout(&env);
+        Self::store_proposal(&env, &proposal);
         emit_event(&env, "recovery_approved", guardian);
         Ok(())
     }
@@ -1259,9 +1267,8 @@ impl GlobeWallet {
         if proposal.approvals.len() < config.threshold {
             proposal.ready_at = None;
         }
-        env.storage()
-            .instance()
-            .set(&DataKey::RecoveryProposal, &proposal);
+        Self::ensure_storage_layout(&env);
+        Self::store_proposal(&env, &proposal);
         emit_event(&env, "recovery_approval_revoked", guardian);
         Ok(())
     }
@@ -1333,7 +1340,7 @@ impl GlobeWallet {
         env.storage()
             .instance()
             .set(&DataKey::Admin, &proposal.new_admin);
-        env.storage().instance().remove(&DataKey::RecoveryProposal);
+        Self::remove_proposal(&env);
         // A guardian change queued by the replaced admin is discarded: it
         // was authorized by the very key the guardians just voted out (#175).
         let stale_change: Option<GuardianChange> =
@@ -1398,7 +1405,7 @@ impl GlobeWallet {
             return Err(WalletError::RecoveryCancelNotAllowed);
         }
         Self::bump_instance_ttl(&env);
-        env.storage().instance().remove(&DataKey::RecoveryProposal);
+        Self::remove_proposal(&env);
         emit_event(&env, "recovery_cancelled", admin);
         Ok(())
     }
@@ -1592,33 +1599,34 @@ impl GlobeWallet {
         if limit < 0 {
             return Err(WalletError::InvalidSpendLimit);
         }
-        // Retroactive check: reject if the rolling-window spend already
-        // exceeds the new limit (unless the new limit is 0 = unlimited).
-        // Spends are tracked even while no limit is set (issue #179), so a
-        // limit enabled after a large spend sees that spend here.
-        if limit != 0 {
-            let window = Self::load_spend_window(
-                &env,
-                &user,
-                &asset_code,
-                env.ledger().timestamp(),
-            );
-            if Self::window_total(&window) > limit {
-                return Err(WalletError::SpendLimitExceeded);
+        Self::bump_instance_ttl(&env);
+        Self::promote_matured_spend_limit(&env, &user, &token_id);
+        let current = Self::stored_spend_limit(&env, &user, &token_id);
+        let is_decrease = limit != 0 && (current == 0 || limit <= current);
+        let is_noop = limit == current;
+
+        if is_decrease || is_noop {
+            // Retroactive check against the rolling window. Spends are
+            // tracked even while no limit is set (issue #179), so a limit
+            // enabled after a large spend sees that spend here.
+            if limit != 0 {
+                let window =
+                    Self::load_spend_window(&env, &user, &token_id, env.ledger().timestamp());
+                if Self::window_total(&window) > limit {
+                    return Err(WalletError::SpendLimitExceeded);
+                }
             }
             Self::write_spend_limit(&env, &user, &token_id, limit);
             let pending_key = DataKey::PendingSpendLimit(user.clone(), token_id.clone());
             if env.storage().persistent().has(&pending_key) {
                 env.storage().persistent().remove(&pending_key);
-                env.events().publish(
-                    (Symbol::new(&env, "spend_limit_increase_cancelled"),),
+                emit_event(
+                    &env,
+                    "spend_limit_increase_cancelled",
                     (user.clone(), token_id.clone()),
                 );
             }
-            env.events().publish(
-                (Symbol::new(&env, "spend_limit_set"),),
-                (user, token_id, limit),
-            );
+            emit_event(&env, "spend_limit_set", (user, token_id, limit));
             return Ok(());
         }
 
@@ -1635,82 +1643,208 @@ impl GlobeWallet {
             PERSISTENT_TTL_THRESHOLD,
             PERSISTENT_TTL_EXTEND_TO,
         );
-        emit_event(&env, "spend_limit_set", (user, asset_code, limit),
+        emit_event(
+            &env,
+            "spend_limit_increase_pending",
+            (user, token_id, current, limit, effective_at),
         );
         Ok(())
     }
 
-    /// Get the daily spend limit for a user/asset pair (0 = unlimited).
+    /// Store `limit` for (user, token) and keep the opt-in marker in step
+    /// (issue #185): set for a non-zero limit, cleared for unlimited.
+    fn write_spend_limit(env: &Env, user: &Address, token_id: &Address, limit: i128) {
+        let storage = env.storage().persistent();
+        let key = DataKey::TokenSpendLimit(user.clone(), token_id.clone());
+        let opt_in = DataKey::LimitOptIn(user.clone(), token_id.clone());
+        if limit == 0 {
+            storage.remove(&key);
+            storage.remove(&opt_in);
+            return;
+        }
+        storage.set(&key, &limit);
+        storage.extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+        storage.set(&opt_in, &true);
+        storage.extend_ttl(&opt_in, OPT_IN_TTL_THRESHOLD, OPT_IN_TTL_EXTEND_TO);
+    }
+
+    fn stored_spend_limit(env: &Env, user: &Address, token_id: &Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TokenSpendLimit(user.clone(), token_id.clone()))
+            .unwrap_or(0)
+    }
+
+    /// Apply a pending increase whose delay has elapsed.
+    fn promote_matured_spend_limit(env: &Env, user: &Address, token_id: &Address) {
+        let key = DataKey::PendingSpendLimit(user.clone(), token_id.clone());
+        let pending: Option<PendingSpendLimit> = env.storage().persistent().get(&key);
+        if let Some(p) = pending {
+            if env.ledger().timestamp() >= p.effective_at {
+                Self::write_spend_limit(env, user, token_id, p.limit);
+                env.storage().persistent().remove(&key);
+                emit_event(env, "spend_limit_set", (user.clone(), token_id.clone(), p.limit));
+            }
+        }
+    }
+
+    /// The pending limit increase for (user, token), if any.
+    pub fn pending_spend_limit(env: Env, user: Address, token_id: Address) -> Option<PendingSpendLimit> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PendingSpendLimit(user, token_id))
+    }
+
+    /// Cancel a pending limit increase before it takes effect. The owner or
+    /// any guardian may cancel.
     ///
-    /// Fails closed (issue #185): if the user opted into a limit for this
-    /// asset (`LimitOptIn` marker present) but the `SpendLimit` entry is
-    /// missing, this panics with [`WalletError::SpendLimitArchived`] rather
-    /// than reporting "unlimited". `record_spend` and `send` go through this
-    /// function, so an archived limit blocks spending until it is restored.
-    pub fn get_spend_limit(env: Env, user: Address, asset_code: String) -> i128 {
-        match Self::effective_limit(&env, &user, &asset_code) {
+    /// # Errors
+    /// * [`WalletError::NoPendingSpendLimit`]
+    pub fn cancel_pending_spend_limit(
+        env: Env,
+        caller: Address,
+        user: Address,
+        token_id: Address,
+    ) -> Result<(), WalletError> {
+        caller.require_auth();
+        if caller != user {
+            Self::require_guardian(&env, &caller)?;
+        }
+        let key = DataKey::PendingSpendLimit(user.clone(), token_id.clone());
+        let pending: Option<PendingSpendLimit> = env.storage().persistent().get(&key);
+        match pending {
+            Some(p) if env.ledger().timestamp() < p.effective_at => {}
+            _ => return Err(WalletError::NoPendingSpendLimit),
+        }
+        Self::bump_instance_ttl(&env);
+        env.storage().persistent().remove(&key);
+        emit_event(&env, "spend_limit_increase_cancelled", (user, token_id));
+        Ok(())
+    }
+
+    /// Admin: move a legacy `(user, asset_code)` limit and spend record onto
+    /// the token-keyed storage (issue #173). The stricter limit wins.
+    /// Returns `false` when there was nothing to migrate.
+    pub fn migrate_spend_limit(
+        env: Env,
+        admin: Address,
+        user: Address,
+        asset_code: String,
+        token_id: Address,
+    ) -> Result<bool, WalletError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        let legacy_limit_key = DataKey::SpendLimit(user.clone(), asset_code.clone());
+        let legacy_spent_key = DataKey::DailySpent(user.clone(), asset_code.clone());
+        let legacy_limit: Option<i128> = env.storage().persistent().get(&legacy_limit_key);
+        let Some(legacy_limit) = legacy_limit else {
+            return Ok(false);
+        };
+        Self::bump_instance_ttl(&env);
+        let existing = Self::stored_spend_limit(&env, &user, &token_id);
+        let merged = match (existing, legacy_limit) {
+            (0, l) => l,
+            (e, 0) => e,
+            (e, l) => e.min(l),
+        };
+        Self::write_spend_limit(&env, &user, &token_id, merged);
+
+        let legacy_spent: Option<SpendRecord> = env.storage().persistent().get(&legacy_spent_key);
+        if let Some(record) = legacy_spent {
+            let new_key = DataKey::TokenDailySpent(user.clone(), token_id.clone());
+            let current: Option<SpendRecord> = env.storage().persistent().get(&new_key);
+            let merged_record = match current {
+                Some(c) if c.day == record.day => SpendRecord {
+                    amount: c.amount.saturating_add(record.amount),
+                    day: c.day,
+                },
+                Some(c) if c.day > record.day => c,
+                _ => record,
+            };
+            env.storage().persistent().set(&new_key, &merged_record);
+            env.storage().persistent().extend_ttl(
+                &new_key,
+                DAILY_SPENT_TTL_THRESHOLD,
+                DAILY_SPENT_TTL_EXTEND_TO,
+            );
+        }
+        env.storage().persistent().remove(&legacy_limit_key);
+        env.storage().persistent().remove(&legacy_spent_key);
+        emit_event(
+            &env,
+            "spend_limit_migrated",
+            (user, asset_code, token_id, merged),
+        );
+        Ok(true)
+    }
+
+    /// Effective daily cap for (user, token); 0 = unlimited. Panics with
+    /// `SpendLimitArchived` if the limit was archived (issue #185).
+    pub fn get_spend_limit(env: Env, user: Address, token_id: Address) -> i128 {
+        match Self::effective_limit(&env, &user, &token_id) {
             Ok(limit) => limit,
             Err(e) => panic_with_error!(&env, e),
         }
     }
 
-    /// `true` when `(user, asset_code)` opted into a limit whose entry is
-    /// now missing — i.e. spending is blocked until a restore. Never panics,
-    /// so keepers and UIs can probe it safely (issue #185).
-    pub fn is_limit_archived(env: Env, user: Address, asset_code: String) -> bool {
-        Self::effective_limit(&env, &user, &asset_code).is_err()
+    /// `true` when a limit was set but its entry has been archived.
+    pub fn is_limit_archived(env: Env, user: Address, token_id: Address) -> bool {
+        Self::effective_limit(&env, &user, &token_id).is_err()
     }
 
-    /// Permissionless TTL keeper (issue #185): extends every persistent
-    /// entry belonging to `user` (`UserAssets`, and per registered asset its
-    /// `SpendLimit`, `LimitOptIn` and `DailySpent`) plus the contract
-    /// instance. Anyone may pay to keep a wallet alive; it changes no values,
-    /// only lifetimes, so no auth is required. Returns the number of entries
-    /// extended. Entries that are already archived are skipped (they need a
-    /// `RestoreFootprint` operation, which the backend adds automatically).
+    /// Keep a user's entries alive (issue #185). Permissionless so a keeper
+    /// can pay for it. Returns how many entries were extended.
     pub fn extend_user_ttl(env: Env, user: Address) -> u32 {
         Self::bump_instance_ttl(&env);
         let storage = env.storage().persistent();
         let mut extended: u32 = 0;
         let assets_key = DataKey::UserAssets(user.clone());
-        let assets: Vec<AssetInfo> = match storage.get(&assets_key) {
-            Some(a) => {
-                storage.extend_ttl(&assets_key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
-                extended += 1;
-                a
-            }
-            None => Vec::new(&env),
-        };
-        for asset in assets.iter() {
-            let limit_key = DataKey::SpendLimit(user.clone(), asset.code.clone());
+        if storage.has(&assets_key) {
+            storage.extend_ttl(&assets_key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+            extended += 1;
+        }
+        // Spend state is keyed by token, so walk the allowlisted tokens.
+        for token_id in Self::get_allowed_tokens(env.clone()).iter() {
+            let limit_key = DataKey::TokenSpendLimit(user.clone(), token_id.clone());
             if storage.has(&limit_key) {
                 storage.extend_ttl(&limit_key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
                 extended += 1;
             }
-            let opt_key = DataKey::LimitOptIn(user.clone(), asset.code.clone());
+            let opt_key = DataKey::LimitOptIn(user.clone(), token_id.clone());
             if storage.has(&opt_key) {
                 storage.extend_ttl(&opt_key, OPT_IN_TTL_THRESHOLD, OPT_IN_TTL_EXTEND_TO);
                 extended += 1;
             }
-            let spent_key = DataKey::DailySpent(user.clone(), asset.code.clone());
-            if storage.has(&spent_key) {
-                storage.extend_ttl(&spent_key, DAILY_SPENT_TTL_THRESHOLD, DAILY_SPENT_TTL_EXTEND_TO);
+            let window_key = DataKey::SpendWindow(user.clone(), token_id.clone());
+            if storage.has(&window_key) {
+                storage.extend_ttl(&window_key, DAILY_SPENT_TTL_THRESHOLD, DAILY_SPENT_TTL_EXTEND_TO);
+                extended += 1;
+            }
+            let pending_key = DataKey::PendingSpendLimit(user.clone(), token_id.clone());
+            if storage.has(&pending_key) {
+                storage.extend_ttl(&pending_key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
                 extended += 1;
             }
         }
-        env.events().publish(
-            (Symbol::new(&env, "user_ttl_extended"),),
-            (user, extended),
-        );
+        emit_event(&env, "user_ttl_extended", (user, extended));
         extended
     }
 
-    fn effective_limit(env: &Env, user: &Address, asset_code: &String) -> Result<i128, WalletError> {
+    /// Limit in force now, counting a matured pending increase. An opt-in
+    /// marker without a limit entry means the limit was archived: fail safe.
+    fn effective_limit(env: &Env, user: &Address, token_id: &Address) -> Result<i128, WalletError> {
         let storage = env.storage().persistent();
-        match storage.get::<_, i128>(&DataKey::SpendLimit(user.clone(), asset_code.clone())) {
+        let pending: Option<PendingSpendLimit> =
+            storage.get(&DataKey::PendingSpendLimit(user.clone(), token_id.clone()));
+        if let Some(p) = pending {
+            if env.ledger().timestamp() >= p.effective_at {
+                return Ok(p.limit);
+            }
+        }
+        match storage.get::<_, i128>(&DataKey::TokenSpendLimit(user.clone(), token_id.clone())) {
             Some(limit) => Ok(limit),
             None => {
-                if storage.has(&DataKey::LimitOptIn(user.clone(), asset_code.clone())) {
+                if storage.has(&DataKey::LimitOptIn(user.clone(), token_id.clone())) {
                     Err(WalletError::SpendLimitArchived)
                 } else {
                     Ok(0)
@@ -1719,20 +1853,17 @@ impl GlobeWallet {
         }
     }
 
-    /// Amount spent by `user` in `asset_code` in the rolling 24 h window
-    /// (issues #50, #177). Name kept for API compatibility.
-    pub fn get_spent_today(env: Env, user: Address, asset_code: String) -> i128 {
-        let window = Self::load_spend_window(&env, &user, &asset_code, env.ledger().timestamp());
+    /// Amount spent in the trailing 24 h window.
+    pub fn get_spent_today(env: Env, user: Address, token_id: Address) -> i128 {
+        let window = Self::load_spend_window(&env, &user, &token_id, env.ledger().timestamp());
         Self::window_total(&window)
     }
 
-    /// Limit, spent and remaining amounts for the rolling window, plus when
-    /// the allowance next refills (issues #50, #177). Read-only; intended to
-    /// be simulated rather than submitted.
+    /// Limit, spend and refill times for the rolling window (issue #177).
     pub fn get_spend_allowance(env: Env, user: Address, token_id: Address) -> SpendAllowance {
         let now = env.ledger().timestamp();
-        let limit = Self::get_spend_limit(env.clone(), user.clone(), asset_code.clone());
-        let window = Self::load_spend_window(&env, &user, &asset_code, now);
+        let limit = Self::get_spend_limit(env.clone(), user.clone(), token_id.clone());
+        let window = Self::load_spend_window(&env, &user, &token_id, now);
         let spent = Self::window_total(&window);
         let remaining = if limit == 0 {
             0
@@ -1787,12 +1918,12 @@ impl GlobeWallet {
     /// bucket if any of that day could still fall inside the last 24 h. That
     /// over-counts (the amount stays counted for up to 25 h from now) but
     /// never under-counts across the upgrade.
-    fn load_spend_window(env: &Env, user: &Address, asset_code: &String, now: u64) -> SpendWindow {
+    fn load_spend_window(env: &Env, user: &Address, token_id: &Address, now: u64) -> SpendWindow {
         let hour = now / SPEND_BUCKET_SECONDS;
         let stored: Option<SpendWindow> = env
             .storage()
             .persistent()
-            .get(&DataKey::SpendWindow(user.clone(), asset_code.clone()));
+            .get(&DataKey::SpendWindow(user.clone(), token_id.clone()));
         let mut window = match stored {
             Some(w) if w.buckets.len() == SPEND_WINDOW_BUCKETS => w,
             _ => {
@@ -1804,7 +1935,7 @@ impl GlobeWallet {
                 let legacy: Option<SpendRecord> = env
                     .storage()
                     .persistent()
-                    .get(&DataKey::DailySpent(user.clone(), asset_code.clone()));
+                    .get(&DataKey::TokenDailySpent(user.clone(), token_id.clone()));
                 if let Some(r) = legacy {
                     let legacy_end = r.day.saturating_add(1).saturating_mul(SECONDS_PER_DAY);
                     if r.amount > 0 && legacy_end.saturating_add(SECONDS_PER_DAY) > now {
@@ -1879,17 +2010,16 @@ impl GlobeWallet {
         // limit happens to be configured for this asset (see
         // `bump_instance_ttl`'s doc comment).
         Self::bump_instance_ttl(&env);
-        let limit = Self::effective_limit(&env, &user, &asset_code)?;
-        if limit == 0 {
-            // No limit configured → always allow
-            return Ok(());
-        }
+        Self::promote_matured_spend_limit(&env, &user, &token_id);
+        let limit = Self::effective_limit(&env, &user, &token_id)?;
+        // Always record, limit or not (issue #179): a limit switched on
+        // later must see spends made while the token was unlimited.
         let now = env.ledger().timestamp();
-        let mut window = Self::load_spend_window(&env, &user, &asset_code, now);
+        let mut window = Self::load_spend_window(&env, &user, &token_id, now);
         let spent = Self::window_total(&window);
         let new_spent = match spent.checked_add(amount) {
             Some(v) => v,
-            // Unlimited assets must never be blocked by bookkeeping.
+            // Unlimited tokens must never be blocked by bookkeeping.
             None if limit == 0 => i128::MAX,
             None => return Err(WalletError::SpendOverflow),
         };
@@ -1899,15 +2029,19 @@ impl GlobeWallet {
         let slot = Self::spend_slot(window.head_hour);
         let bucket = window.buckets.get(slot).unwrap_or(0);
         window.buckets.set(slot, bucket.saturating_add(amount));
-        let key = DataKey::SpendWindow(user.clone(), asset_code.clone());
+        let key = DataKey::SpendWindow(user.clone(), token_id.clone());
         env.storage().persistent().set(&key, &window);
         env.storage().persistent().extend_ttl(
             &key,
             DAILY_SPENT_TTL_THRESHOLD,
             DAILY_SPENT_TTL_EXTEND_TO,
         );
-        emit_event(&env, "spend_recorded", (user, asset_code, amount, new_spent, limit),
-        );
+        // The legacy record has been folded into the window; drop it.
+        let legacy_key = DataKey::TokenDailySpent(user.clone(), token_id.clone());
+        if env.storage().persistent().has(&legacy_key) {
+            env.storage().persistent().remove(&legacy_key);
+        }
+        emit_event(&env, "spend_recorded", (user, token_id, amount, new_spent, limit));
         Ok(())
     }
 
@@ -2299,7 +2433,7 @@ impl GlobeWallet {
         //    a plain associated-function call (same host frame), so
         //    record_spend's existing reentrancy proof
         //    (docs/record-spend-reentrancy.md) is untouched by this wiring.
-        Self::record_spend(env.clone(), user.clone(), asset_code.clone(), amount)?;
+        Self::record_spend(env.clone(), user.clone(), token_id.clone(), amount)?;
 
         let wrapper_id: Address = env
             .storage()
@@ -2328,7 +2462,6 @@ impl GlobeWallet {
                     SendExecutedEvent {
                         user,
                         token_id,
-                        asset_code,
                         to,
                         amount,
                     },
@@ -2460,7 +2593,7 @@ impl GlobeWallet {
         for i in 0..Self::MAX_ASSETS {
             trimmed.push_back(assets.get(i).unwrap());
         }
-        // Issue #178: spend limits are keyed by (user, asset_code) and are
+        // Issue #178: spend limits are keyed by (user, token) and are
         // independent of the display list. Trimming the list must never
         // delete a limit or its spend window — a missing limit means
         // "unlimited" and the token stays sendable. Every trimmed asset gets
@@ -2468,9 +2601,10 @@ impl GlobeWallet {
         // tell the user which assets left their list.
         for i in Self::MAX_ASSETS..len {
             let dropped = assets.get(i).unwrap();
-            env.storage().persistent().remove(&DataKey::SpendLimit(user.clone(), dropped.code.clone()));
-            env.storage().persistent().remove(&DataKey::DailySpent(user.clone(), dropped.code.clone()));
-            env.storage().persistent().remove(&DataKey::LimitOptIn(user.clone(), dropped.code.clone()));
+            env.events().publish(
+                (Symbol::new(&env, "migration"), Symbol::new(&env, "asset_untracked")),
+                (user.clone(), dropped.code.clone()),
+            );
         }
         env.storage()
             .persistent()
@@ -2773,10 +2907,7 @@ impl GlobeWallet {
     }
 
     fn require_pending_recovery(env: &Env) -> Result<RecoveryProposal, WalletError> {
-        env.storage()
-            .instance()
-            .get(&DataKey::RecoveryProposal)
-            .ok_or(WalletError::NoPendingRecovery)
+        Self::recovery_proposal(env.clone()).ok_or(WalletError::NoPendingRecovery)
     }
 }
 
