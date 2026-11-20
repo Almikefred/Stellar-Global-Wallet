@@ -109,3 +109,21 @@ await client.request('/api/v1/wallet/submit', {
 
 All failures reject with typed errors from the SDK error-code catalogue, so
 callers can branch on `code` instead of parsing messages.
+
+## Signed manifests
+
+Contract ids and network URLs from the API are only trusted after the
+manifest's ed25519 signature checks out against a release key pinned in the
+app. A tampered or unsigned manifest throws `ManifestVerificationError`.
+
+```ts
+import { verifySignedManifest } from '@globe-wallet/sdk';
+
+const PINNED_KEYS = ['GRELEASE...']; // add the next key here before rotating
+const manifest = verifySignedManifest(await res.json(), PINNED_KEYS);
+```
+
+Release tooling signs with the offline key via
+`signManifest(manifest, process.env.MANIFEST_SIGNING_SECRET)`. To rotate,
+ship the new public key next to the old one, switch signing to the new key,
+then remove the old key in a later release.
