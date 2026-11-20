@@ -17,11 +17,13 @@
  *     between "check" and "connect");
  *   - redirects are followed at most MAX_REDIRECTS times and each hop goes
  *     through the same checks;
- *   - hard timeout and response-size cap, enforced while streaming.
+ *   - hard timeout and response-size cap, enforced while streaming;
+ *   - blocks octal/hex/decimal IP literals (e.g. 0x7f000001, 0177.0.0.1);
+ *   - blocks IPv4-mapped IPv6 addresses.
  */
-import https from "node:https";
-import dns from "node:dns";
-import net from "node:net";
+import * as https from "node:https";
+import * as dns from "node:dns";
+import * as net from "node:net";
 import type { LookupFunction } from "node:net";
 
 export type SafeFetchFailure =
@@ -55,7 +57,25 @@ const MAX_REDIRECTS = 3;
 const HOSTNAME_PATTERN = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,62}$/i;
 
 export function isValidPublicHostname(hostname: string): boolean {
-  return HOSTNAME_PATTERN.test(hostname) && net.isIP(hostname) === 0;
+  if (HOSTNAME_PATTERN.test(hostname) && net.isIP(hostname) === 0) {
+    return true;
+  }
+  // Block octal/hex/decimal IP literals (e.g. 0x7f000001, 0177.0.0.1, 2130706433)
+  return !isValidIPLiteral(hostname);
+}
+
+function isValidIPLiteral(hostname: string): boolean {
+  // Octal IPv4 (0177.0.0.1)
+  if (/^0[0-7]\.[0-7]+\.[0-7]+\.[0-7]+$/.test(hostname)) return true;
+  // Hex IPv4 (0x7f000001)
+  if (/^0x[0-9a-fA-F]{8}$/.test(hostname)) return true;
+  // Decimal IPv4 (2130706433)
+  if (/^\d+$/.test(hostname) && net.isIP(hostname) === 4) return true;
+  // Standard dotted-quad IPv4
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(hostname)) return true;
+  // IPv6 literal (starts with [ or contains ::)
+  if (hostname.startsWith("[") || hostname.includes("::")) return true;
+  return false;
 }
 
 function ipv4ToInt(ip: string): number {
