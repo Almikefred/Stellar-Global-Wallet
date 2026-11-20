@@ -6,10 +6,47 @@ import { ensurePreferencesTable } from "./routes/preferences";
 import { ensureBuiltTransactionsTable } from "./services/builtTransactions";
 import { ensureFeeSponsorshipTable } from "./services/feeSponsorship";
 import { ensureActivityFeedTable } from "./services/activityFeed";
+import { runMigrations } from "./migrations/runner";
 
-export const pool = new Pool({ connectionString: config.DATABASE_URL });
+const POOL_MAX_CLIENTS = config.NODE_ENV === "production" ? 20 : 10;
+const SLOW_QUERY_THRESHOLD_MS = 200;
+
+export const pool = new Pool({
+  connectionString: config.DATABASE_URL,
+  max: POOL_MAX_CLIENTS,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 5000,
+});
+
+pool.on("error", (err) => {
+  console.error("[postgres] Unexpected idle client error", err.message);
+});
+
+// Intercept queries for slow query logging (#219)
+const originalQuery = pool.query.bind(pool);
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+pool.query = (async (...args: any[]) => {
+  const start = Date.now();
+  try {
+    // @ts-expect-error query overload forwarding
+    return await originalQuery(...args);
+  } finally {
+    const duration = Date.now() - start;
+    if (duration > SLOW_QUERY_THRESHOLD_MS) {
+      const sql = typeof args[0] === "string" ? args[0] : (args[0] as { text?: string })?.text ?? "";
+      const snippet = sql.replace(/\s+/g, " ").trim().slice(0, 100);
+      console.warn(`[postgres] SLOW QUERY (${duration}ms): ${snippet}`);
+    }
+  }
+}) as typeof pool.query;
 
 export async function ensureAuditTable() {
+  // #219 — run managed migrations before legacy idempotent checks
+  try {
+    await runMigrations(pool, "up");
+  } catch (err) {
+    console.error("[migrations] Error executing migrations:", err);
+  }
   await pool.query(`
     CREATE TABLE IF NOT EXISTS keypair_audit_log (
       id BIGSERIAL PRIMARY KEY,

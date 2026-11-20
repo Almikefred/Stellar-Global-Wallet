@@ -2,8 +2,9 @@ import { Request, Response, NextFunction } from "express";
 import { TokenExpiredError } from "jsonwebtoken";
 import { verifyAccessToken } from "../utils/jwt";
 import { UnauthorizedError } from "../errors/appError";
+import { sessionStore } from "../services/sessionStore";
 
-export function jwtAuth(req: Request, res: Response, next: NextFunction) {
+export async function jwtAuth(req: Request, res: Response, next: NextFunction) {
   const header = req.header("Authorization");
   // No credential at all: tell the client to sign in. A legacy x-api-key
   // (#40) or a non-Bearer header is a malformed credential instead.
@@ -28,6 +29,17 @@ export function jwtAuth(req: Request, res: Response, next: NextFunction) {
       next(new UnauthorizedError("Invalid token type", "AUTH_TOKEN_TYPE_INVALID"));
       return;
     }
+
+    // #200 — check revocation on every request (cached in-memory for 1s)
+    const sessionId = (payload as Record<string, unknown>).session_id as string | undefined;
+    if (sessionId) {
+      const revoked = await sessionStore.isSessionRevoked(payload.sub, sessionId);
+      if (revoked) {
+        next(new UnauthorizedError("Session has been revoked", "SESSION_REVOKED"));
+        return;
+      }
+    }
+
     req.user = { sub: payload.sub };
     next();
   } catch (err) {

@@ -12,6 +12,8 @@
     "test:e2e": "E2E_TESTNET=1 jest --config jest.e2e.config.js",
     "lint": "eslint src --ext .ts",
     "type-check": "tsc --noEmit -p tsconfig.json",
+    "migrate": "tsx src/migrations/cli.ts up",
+    "migrate:down": "tsx src/migrations/cli.ts down",
     "seed:demo": "tsx scripts/seed-demo-wallet.ts"
   },
   "dependencies": {

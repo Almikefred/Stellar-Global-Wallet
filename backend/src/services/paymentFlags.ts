@@ -50,10 +50,17 @@ export function memoContainsUrl(memo: string | undefined): boolean {
   return typeof memo === "string" && URL_PATTERN.test(memo);
 }
 
+import { toStroops } from "../utils/stroops";
+
 export function isDustAmount(amount: string | undefined, dustThreshold: number): boolean {
   if (!amount) return false;
-  const value = Number.parseFloat(amount);
-  return Number.isFinite(value) && value > 0 && value < dustThreshold;
+  try {
+    const stroops = toStroops(amount);
+    const thresholdStroops = BigInt(Math.round(dustThreshold * 10_000_000));
+    return stroops > 0n && stroops < thresholdStroops;
+  } catch {
+    return false;
+  }
 }
 
 export function assetKey(assetCode?: string, assetIssuer?: string): string {
