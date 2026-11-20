@@ -48,9 +48,9 @@ export interface SessionInfo {
 
 const ACCESS_EXPIRY = "15m";
 const REFRESH_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000;
-const REFRESH_KEY_PREFIX = "orbit-wal:refresh-token:";
-const SESSION_KEY_PREFIX = "orbit-wal:session:";
-const ACCOUNT_SESSIONS_KEY_PREFIX = "orbit-wal:account-sessions:";
+const REFRESH_KEY_PREFIX = `orbit-wal:${config.STELLAR_NETWORK}:refresh-token:`;
+const SESSION_KEY_PREFIX = `orbit-wal:${config.STELLAR_NETWORK}:session:`;
+const ACCOUNT_SESSIONS_KEY_PREFIX = `orbit-wal:${config.STELLAR_NETWORK}:account-sessions:`;
 
 export function generateAccessToken(sub: string, authMethod?: AuthMethod): string {
   const payload: TokenPayload = { sub, type: "access" };

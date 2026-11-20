@@ -2,6 +2,7 @@ import type { RedisClientType } from "redis";
 import { AccountLockOptions, BaseAccountLock } from "./accountLock";
 import { LockUnavailableError } from "../stellarErrors";
 import { metrics } from "../metrics";
+import { config } from "../../config";
 
 // Atomically take the lock and bump the per-account fencing counter. The
 // counter key never expires, so tokens keep increasing across holders.
@@ -51,7 +52,10 @@ export class RedisAccountLock extends BaseAccountLock {
   }
 
   private keys(accountId: string): [string, string] {
-    return [`orbit-wal:account-lock:${accountId}`, `orbit-wal:account-lock-fence:${accountId}`];
+    return [
+      `orbit-wal:${config.STELLAR_NETWORK}:account-lock:${accountId}`,
+      `orbit-wal:${config.STELLAR_NETWORK}:account-lock-fence:${accountId}`,
+    ];
   }
 
   protected async tryAcquire(accountId: string, token: string): Promise<number | null> {

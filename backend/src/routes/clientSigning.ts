@@ -4,6 +4,7 @@ import { jwtAuth } from "../middleware/jwtAuth";
 import { assertValidRequest, rejectUnknownBodyFields } from "../middleware/requestValidation";
 import { cacheResult, getCachedResult } from "../services/idempotency";
 import { StellarService } from "../services/stellar";
+import { shutdownManager } from "../services/shutdown";
 import { publicKeyMessage } from "../utils/stellarAddress";
 import {
   assetParamMessage,
@@ -146,7 +147,9 @@ export function createClientSigningRouter(stellar: StellarService): Router {
           }
         }
 
-        const result = await stellar.submitSigned({ signedXdr });
+        const result = await shutdownManager.trackSubmission(() =>
+          stellar.submitSigned({ signedXdr })
+        );
         if ("status" in result) {
           // Horizon timed out; the transaction may still land.
           res.status(202).json(result);

@@ -1,0 +1,38 @@
+# Promtool Rule Test Suite for GlobeWallet SLO Alerts (#222)
+rule_files:
+  - slos.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # Test Case 1: High submission failure rate triggers critical 1h burn-rate alert
+  - interval: 1m
+    input_series:
+      - series: 'wallet_submissions_total{status="failed"}'
+        values: '0+75x60' # 75 failed/min
+      - series: 'wallet_submissions_total{status="success"}'
+        values: '0+25x60' # 25 success/min -> 75% error rate, far exceeding 14.4 * 0.005 (7.2%)
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: WalletSubmissionCriticalBurnRate1h
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              tier: critical
+            exp_annotations:
+              summary: "Critical burn rate: 14.4x budget consumption for wallet submissions"
+
+  # Test Case 2: Indexer lag exceeds threshold
+  - interval: 1m
+    input_series:
+      - series: 'activity_feed_indexer_lag_ledgers{contract="CBGLPMNS"}'
+        values: '5 10 15 25 30 35 40 45 50 55'
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: ActivityFeedIndexerLagHigh
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              tier: warning
+            exp_annotations:
+              summary: "Activity feed indexer is lagging behind Stellar ledger tip"

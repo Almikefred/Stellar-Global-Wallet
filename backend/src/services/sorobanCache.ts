@@ -31,8 +31,8 @@ import { createClient, RedisClientType } from "redis";
 import { config } from "../config";
 
 const CACHE_TTL_SECONDS = 15;
-const KEY_PREFIX = "orbit-wal:soroban-cache:";
-const PUBSUB_CHANNEL = "orbit-wal:soroban-cache:invalidate";
+const KEY_PREFIX = `orbit-wal:${config.STELLAR_NETWORK}:soroban-cache:`;
+const PUBSUB_CHANNEL = `orbit-wal:${config.STELLAR_NETWORK}:soroban-cache:invalidate`;
 
 type CacheClient = ReturnType<typeof createClient>;
 
@@ -65,7 +65,7 @@ function buildKey(contractId: string, method: string, args: string): string {
  * Track users with pending transactions to implement read-your-writes.
  * Key: userPublicKey, Value: expiry timestamp (ms).
  */
-const PENDING_TX_USER_PREFIX = "orbit-wal:soroban-cache:pending-tx:";
+const PENDING_TX_USER_PREFIX = `orbit-wal:${config.STELLAR_NETWORK}:soroban-cache:pending-tx:`;
 
 /** TTL for pending transaction flags (5 minutes). */
 const PENDING_TX_TTL_MS = 5 * 60 * 1000;

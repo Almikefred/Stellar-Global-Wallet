@@ -24,7 +24,10 @@ import {
   SubmitSignedPending,
   SubmitSignedResult,
   UnsignedTransactionInfo,
+  verifyEnvelopeNetwork,
 } from "./transactionEnvelope";
+import { withSpan } from "../telemetry";
+import { metrics } from "./metrics";
 import type { TransactionDetail, TransactionSummary } from "@stellar-global-wallet/types";
 import { fromStroops, toStroops } from "../utils/stroops";
 import { isGAddress } from "../utils/stellarAddress";
@@ -172,7 +175,14 @@ export class StellarService {
 
   async getAccount(publicKey: string) {
     try {
-      return await this.server.loadAccount(publicKey);
+      return await withSpan(
+        "horizon.load_account",
+        {
+          "rpc.system": "stellar_horizon",
+          "stellar.account": publicKey,
+        },
+        () => this.server.loadAccount(publicKey)
+      );
     } catch (err) {
       if (hasResponseStatus(err, 404)) {
         throw new NotFoundError(`Account ${publicKey} was not found on Horizon`, "ACCOUNT_NOT_FOUND");
@@ -834,12 +844,28 @@ export class StellarService {
     if (this.builtTxs) await this.builtTxs.verify(parsed);
     assertNotExpired(parsed.transaction);
 
+    const startTime = Date.now();
     try {
-      const response = await this.server.submitTransaction(parsed.transaction);
+      const response = await withSpan(
+        "horizon.submit_transaction",
+        {
+          "rpc.system": "stellar_horizon",
+          "stellar.network": this.networkPassphrase,
+          "stellar.tx_hash": parsed.hash,
+        },
+        () => this.server.submitTransaction(parsed.transaction)
+      );
+      metrics.submissionsTotal.inc({ status: "success", route: "wallet_submit" });
+      metrics.submissionDurationMs.observe(Date.now() - startTime);
       return { hash: response.hash, ledger: response.ledger, successful: response.successful };
     } catch (err) {
+      metrics.submissionDurationMs.observe(Date.now() - startTime);
       // A gateway timeout says nothing about whether the transaction landed.
-      if (hasResponseStatus(err, 504)) return { hash: parsed.hash, status: "pending" };
+      if (hasResponseStatus(err, 504)) {
+        metrics.submissionsTotal.inc({ status: "pending", route: "wallet_submit" });
+        return { hash: parsed.hash, status: "pending" };
+      }
+      metrics.submissionsTotal.inc({ status: "failed", route: "wallet_submit" });
       throw await this.translateSignedSubmissionError(err, parsed);
     }
   }
@@ -1507,14 +1533,29 @@ export class StellarService {
   }): Promise<StellarSdk.Horizon.HorizonApi.SubmitTransactionResponse> {
     const { xdr, signerSecretKeys } = params;
     const tx = new StellarSdk.Transaction(xdr, this.networkPassphrase);
+    verifyEnvelopeNetwork(tx, this.networkPassphrase);
 
     for (const sk of signerSecretKeys) {
       tx.sign(StellarSdk.Keypair.fromSecret(sk));
     }
 
+    const startTime = Date.now();
     try {
-      return await this.server.submitTransaction(tx);
+      const response = await withSpan(
+        "horizon.submit_transaction",
+        {
+          "rpc.system": "stellar_horizon",
+          "stellar.network": this.networkPassphrase,
+          "stellar.tx_hash": tx.hash().toString("hex"),
+        },
+        () => this.server.submitTransaction(tx)
+      );
+      metrics.submissionsTotal.inc({ status: "success", route: "submit_multisig" });
+      metrics.submissionDurationMs.observe(Date.now() - startTime);
+      return response;
     } catch (err) {
+      metrics.submissionsTotal.inc({ status: "failed", route: "submit_multisig" });
+      metrics.submissionDurationMs.observe(Date.now() - startTime);
       const sourcePublicKey = tx.source;
       throw translateSubmissionError(err, sourcePublicKey);
     }

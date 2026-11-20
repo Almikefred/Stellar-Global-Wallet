@@ -62,6 +62,9 @@ services:
         value: redis
       - key: TRUST_PROXY_HOPS
         value: "1" # Render puts one reverse proxy in front of the service
+      # Graceful shutdown (#220): 25s drain allows in-flight submissions to settle before Render's 30s SIGKILL
+      - key: SHUTDOWN_TIMEOUT_MS
+        value: "25000"
       # Secrets management (#110's "edge case to handle"): generated once by
       # Render at provision time and never committed here. `sync: false`
       # means "required, but Render prompts for it / generates it" rather

@@ -1502,6 +1502,12 @@ components:
                 - ASSET_HAS_ACTIVE_SPEND_LIMIT
             message:
               type: string
+            requestId:
+              type: string
+              description: Inbound request correlation identifier
+            traceId:
+              type: string
+              description: OpenTelemetry W3C distributed tracing identifier
             details:
               type: object
               additionalProperties: true

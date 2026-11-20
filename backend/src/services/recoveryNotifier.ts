@@ -41,7 +41,7 @@ import { tNotification } from "./i18nHelper";
 import { isAssetUntrackedTopic, notifyAssetUntracked } from "./assetMigrationNotifier";
 import { bustContractCache } from "./sorobanCache";
 
-const DEDUP_KEY_PREFIX = "orbit-wal:notif-dedup:recovery:";
+const DEDUP_KEY_PREFIX = `orbit-wal:${config.STELLAR_NETWORK}:notif-dedup:recovery:`;
 const DEDUP_TTL_SECONDS = 48 * 60 * 60;
 const POLL_INTERVAL_MS = 10_000; // poll every 10 s
 const RECONNECT_DELAY_MS = 15_000;

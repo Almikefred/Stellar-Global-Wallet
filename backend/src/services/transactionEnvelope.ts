@@ -93,7 +93,7 @@ function innerTransaction(tx: AnyTransaction): StellarSdk.Transaction {
  * the signer are checked: other co-signers' keys aren't known without
  * loading the account, so those are left for Horizon to judge.
  */
-function assertSignedForThisNetwork(tx: AnyTransaction, signerAddress: string): void {
+export function assertSignedForThisNetwork(tx: AnyTransaction, signerAddress: string): void {
   const signer = StellarSdk.Keypair.fromPublicKey(baseAccountId(signerAddress));
   const hint = Buffer.from(signer.signatureHint());
   const candidates = tx.signatures.filter((sig) => Buffer.from(sig.hint()).equals(hint));
@@ -107,6 +107,19 @@ function assertSignedForThisNetwork(tx: AnyTransaction, signerAddress: string): 
       "WRONG_NETWORK"
     );
   }
+}
+
+/**
+ * End-to-end multi-network safety verification (#223).
+ * Asserts that the envelope's source and fee-bump feeSource signatures match
+ * the expected network passphrase.
+ */
+export function verifyEnvelopeNetwork(tx: AnyTransaction, networkPassphrase?: string): void {
+  const inner = innerTransaction(tx);
+  if ("innerTransaction" in tx) {
+    assertSignedForThisNetwork(tx, tx.feeSource);
+  }
+  assertSignedForThisNetwork(inner, inner.source);
 }
 
 /**

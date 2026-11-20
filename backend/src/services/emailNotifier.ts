@@ -27,7 +27,7 @@ import { createClient } from "redis";
 import { config } from "../config";
 import { tNotification } from "./i18nHelper";
 
-const DEDUP_KEY_PREFIX = "orbit-wal:email-dedup:";
+const DEDUP_KEY_PREFIX = `orbit-wal:${config.STELLAR_NETWORK}:email-dedup:`;
 const DEDUP_TTL_SECONDS = 48 * 60 * 60;
 
 // ── Provider abstraction ───────────────────────────────────────────────────
