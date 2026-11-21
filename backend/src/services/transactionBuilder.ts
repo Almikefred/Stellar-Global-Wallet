@@ -246,16 +246,16 @@ export function buildTrustlineTransaction(
  */
 export function buildTransaction(
   sourceAccount: StellarSdk.Horizon.AccountResponse,
-  operations: StellarSdk.Operation[],
+  operations: StellarSdk.xdr.Operation[],
   memo?: string,
   timeoutSeconds: number = BUILD_TIMEOUT_SECONDS
 ): StellarSdk.Transaction {
   const builder = new StellarSdk.TransactionBuilder(sourceAccount, {
     fee: StellarSdk.BASE_FEE,
     networkPassphrase: config.NETWORK_PASSPHRASE,
-  })
-    .addOperations(operations as any)
-    .setTimeout(timeoutSeconds);
+  });
+  for (const op of operations) builder.addOperation(op);
+  builder.setTimeout(timeoutSeconds);
   if (memo) builder.addMemo(StellarSdk.Memo.text(memo));
   return builder.build();
 }

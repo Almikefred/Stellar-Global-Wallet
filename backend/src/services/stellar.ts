@@ -1599,7 +1599,7 @@ function findTrustline(
  * one base fee. For issued assets: balance - selling liabilities. An issuer
  * sending its own asset has unlimited supply, so it returns its own cap.
  */
-function spendableBalance(
+export function spendableBalance(
   account: StellarSdk.Horizon.AccountResponse,
   asset: StellarSdk.Asset
 ): string | undefined {

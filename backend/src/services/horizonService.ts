@@ -25,6 +25,8 @@ import { assetKey, computePaymentFlags, parseVerifiedAssetsList, PaymentFlag } f
 import { baseAccountId } from "./transactionBuilder";
 import { accountRequiresMemo } from "./transactionBuilder";
 import { SendPrecheckWarning } from "./transactionBuilder";
+import { spendableBalance } from "./stellar";
+import { toStroops } from "../utils/stroops";
 
 export interface HorizonServiceOptions {
   server: StellarSdk.Horizon.Server;
@@ -75,11 +77,11 @@ export class HorizonService {
     publicKey: string,
     options?: { limit?: number; cursor?: string }
   ): Promise<{
-    transactions: { id: string; hash: string; ledger: number; created_at: string; operation_count: number; memo: string | null }[];
+    transactions: { id: string; hash: string; ledger: number; created_at: string; operation_count: number; memo: string | undefined }[];
     next: string | undefined;
     hasMore: boolean;
   }>;
-  async getTransactions(publicKey: string, limit: number): Promise<{ id: string; hash: string; ledger: number; created_at: string; operation_count: number; memo: string | null }[]>;
+  async getTransactions(publicKey: string, limit: number): Promise<{ id: string; hash: string; ledger: number; created_at: string; operation_count: number; memo: string | undefined }[]>;
   async getTransactions(
     publicKey: string,
     optionsOrLimit?: { limit?: number; cursor?: string } | number
@@ -329,9 +331,10 @@ export class HorizonService {
     sendAmount: string,
     destinationAssets: StellarSdk.Asset[]
   ): Promise<StellarSdk.Horizon.ServerApi.PaymentPathRecord[]> {
-    return this.server
-      .strictSendPaths(sourcePublicKey, sendAsset, sendAmount, destinationAssets)
-      .call();
+    // Horizon's strict-send search is keyed on assets only; the source account is not needed.
+    void sourcePublicKey;
+    const page = await this.server.strictSendPaths(sendAsset, sendAmount, destinationAssets).call();
+    return page.records;
   }
 
   async findStrictReceivePaths(
@@ -340,9 +343,10 @@ export class HorizonService {
     receiveAmount: string,
     sourceAssets: StellarSdk.Asset[]
   ): Promise<StellarSdk.Horizon.ServerApi.PaymentPathRecord[]> {
-    return this.server
-      .strictReceivePaths(destinationPublicKey, receiveAsset, receiveAmount, sourceAssets)
-      .call();
+    // Horizon searches from the given source assets; the destination only matters for submission.
+    void destinationPublicKey;
+    const page = await this.server.strictReceivePaths(sourceAssets, receiveAsset, receiveAmount).call();
+    return page.records;
   }
 
   async precheckSend(
@@ -390,8 +394,8 @@ export class HorizonService {
           blocking: true,
         });
       } else {
-        const amountStroops = BigInt(toStroops(amount));
-        const minStartingBalance = BigInt(toStroops("1"));
+        const amountStroops = toStroops(amount);
+        const minStartingBalance = toStroops("1");
         if (amountStroops < minStartingBalance) {
           warnings.push({
             code: "DESTINATION_NOT_FUNDED",
@@ -405,17 +409,15 @@ export class HorizonService {
     // Check source spendable balance
     let spendable: string | undefined;
     if (sourceAccount) {
-      const maxSpendable = BigInt(sourceAccount.max_spendable);
-      const amountStroops = BigInt(toStroops(amount));
+      spendable = spendableBalance(sourceAccount, stellarAsset);
+      const maxSpendable = toStroops(spendable ?? "0");
+      const amountStroops = toStroops(amount);
       if (maxSpendable < amountStroops) {
-        spendable = fromStroops(maxSpendable);
         warnings.push({
           code: "AMOUNT_EXCEEDS_SPENDABLE",
           message: `Insufficient balance. Maximum sendable: ${spendable}`,
           blocking: true,
         });
-      } else {
-        spendable = fromStroops(maxSpendable);
       }
     }
 

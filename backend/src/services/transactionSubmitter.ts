@@ -205,16 +205,11 @@ export class TransactionSubmitter {
 
     // Verify built transaction registry if available
     if (this.builtTransactionRegistry) {
-      const record = await this.builtTransactionRegistry.get(hash);
-      
-      if (!record) {
-        const siblings = await this.builtTransactionRegistry.findBySequence(innerTx.source, innerTx.sequence);
-        if (siblings.length > 0) {
-          await this.statusStore?.update(hash, "failed", { errorMessage: "The signed transaction was modified after it was built" });
-          throw new Error("The signed transaction was modified after it was built");
-        }
-        await this.statusStore?.update(hash, "failed", { errorMessage: "This API only submits transactions built by its own build endpoints" });
-        throw new Error("This API only submits transactions built by its own build endpoints");
+      try {
+        await this.builtTransactionRegistry.verify({ transaction, hash, sourcePublicKey });
+      } catch (err) {
+        await this.statusStore?.update(hash, "failed", { errorMessage: (err as Error).message });
+        throw err;
       }
     }
 
@@ -292,7 +287,7 @@ export class TransactionSubmitter {
           // Update status before throwing
           const status = this.classifyError(err);
           await this.statusStore?.update(hash, status, {
-            errorMessage: err.message,
+            errorMessage: (err as Error).message,
             resultCodes: this.getResultCodes(err),
           });
           
@@ -349,7 +344,7 @@ export class TransactionSubmitter {
     asset?: string,
     amount?: string,
     operationType: "payment" | "createAccount" = "payment"
-  ): StellarSdk.Operation {
+  ): StellarSdk.xdr.Operation {
     if (operationType === "createAccount") {
       return StellarSdk.Operation.createAccount({
         destination: destinationPublicKey,
@@ -371,7 +366,7 @@ export class TransactionSubmitter {
     return (err as { response?: { extras?: { result_codes?: { transaction?: string } } } })?.response?.extras?.result_codes?.transaction === "tx_bad_seq";
   }
 
-  private classifyError(err: unknown): "failed" | "expired" | "pending" {
+  private classifyError(err: unknown): "failed" | "expired" | "pending" | "success" {
     const resultCodes = this.getResultCodes(err);
     
     if (resultCodes?.includes("tx_too_late")) {
