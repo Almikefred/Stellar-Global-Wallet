@@ -15,6 +15,9 @@ report, or runbook) before launch proceeds.
 
 ### Security
 
+- [ ] System-wide threat model reviewed and signed off by two maintainers (see [threat-model.md](threat-model.md), #238).
+- [ ] Exhaustive route authorization matrix passing in CI with zero unclassified routes (see [backend/docs/security/authz-matrix.md](../backend/docs/security/authz-matrix.md), #233).
+- [ ] Nightly Toxiproxy chaos suite passing across Horizon, Soroban RPC, Postgres, and Redis (see [backend/docs/chaos-testing.md](../backend/docs/chaos-testing.md), #234).
 - [ ] Independent smart-contract audit completed; all critical and high findings
       resolved or accepted with documented rationale.
 - [ ] Bug bounty program live for at least 4 weeks on testnet before mainnet

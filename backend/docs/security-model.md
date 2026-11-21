@@ -1,5 +1,7 @@
 # Security Model: Secret Key Handling
 
+> **Note:** For the complete system-wide STRIDE threat model spanning the Soroban smart contracts, backend API, `@globe-wallet/sdk`, and future web/mobile clients (including key-compromise playbooks for user, admin, guardian, and backend keys), see **[`docs/threat-model.md`](../../docs/threat-model.md)** (#238). This document remains the detailed historical reference for the backend's transition from custodial to client-side signing.
+
 ## Overview
 
 This document specifies how this backend handles secret key material, what guarantees are provided today, and the intended long-term architecture. This is a high-stakes design decision — secret keys control real funds on Stellar — and needs to be explicit rather than implicit.
