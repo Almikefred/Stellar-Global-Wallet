@@ -234,6 +234,9 @@ export async function getValidDevicesForAccounts(
   }));
 }
 
+/** Backwards-compatible alias for notification workers importing the prior name. */
+export const getDevicesForAccounts = getValidDevicesForAccounts;
+
 /**
  * Prunes invalid/expired tokens for an account. Returns the count of pruned tokens.
  * Invalid tokens are identified by DeviceNotRegistered error codes.

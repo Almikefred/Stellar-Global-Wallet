@@ -65,6 +65,8 @@ export const ERROR_CODES = [
   "MEMO_REQUIRED",
   "SEQUENCE_CONFLICT",
   "SEP7_INVALID_URI",
+  "IDEMPOTENCY_KEY_REUSED",
+  "IDEMPOTENCY_KEY_IN_FLIGHT",
 
   // Horizon result codes (mapped to a fixed set)
   "HORIZON_ERROR",

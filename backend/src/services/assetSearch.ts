@@ -271,19 +271,22 @@ export class AssetSearchService {
     if (!this.verifiedAssetsCache) {
       this.verifiedAssetsCache = new Set();
       for (const asset of this.deps.verified.verifiedAssets || getVerifiedAssets()) {
-        this.verifiedAssetsCache.add({ code: asset.code, domain: asset.domain });
+        const domain = "domain" in asset && typeof asset.domain === "string" ? asset.domain : "";
+        this.verifiedAssetsCache.add({ code: asset.code, domain });
       }
     }
     return this.verifiedAssetsCache;
   }
 
   private toResult(record: HorizonAssetRecord, allResults: AssetSearchResult[] = []): AssetSearchResult {
-    const base = {
+    const base: AssetSearchResult = {
       code: record.asset_code,
       issuer: record.asset_issuer,
       homeDomain: homeDomainFromToml(record),
       numAccounts: holderCount(record),
       verified: this.deps.verified.isVerified(record.asset_code, record.asset_issuer),
+      riskLevel: "low",
+      riskFactors: [],
     };
 
     // Only compute risk if we have enough context
@@ -293,7 +296,7 @@ export class AssetSearchService {
     }
 
     // Fallback for initial construction (e.g., fetching missing verified assets)
-    return { ...base, riskLevel: "low", riskFactors: [] };
+    return base;
   }
 
   async searchByCode(params: { code: string; limit: number; cursor?: string }): Promise<AssetSearchPage> {
@@ -339,7 +342,6 @@ export class AssetSearchService {
 
     return { results: rankResults(finalResults), nextCursor: null };
   }
-}
 }
 
 /**
