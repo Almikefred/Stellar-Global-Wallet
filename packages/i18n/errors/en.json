@@ -87,5 +87,10 @@
   "PRICE_HISTORY_UNAVAILABLE": "Price history is temporarily unavailable.",
   "FEE_SPONSOR_NOT_CONFIGURED": "Fee sponsorship is not available right now.",
   "FEE_SPONSOR_BUDGET_EXCEEDED": "Today's fee sponsorship limit has been reached. Please try again tomorrow.",
-  "FEE_SPONSOR_INELIGIBLE": "This account isn't eligible for fee sponsorship."
+  "FEE_SPONSOR_INELIGIBLE": "This account isn't eligible for fee sponsorship.",
+  "SERVICE_UNAVAILABLE": "The service is temporarily unavailable. Please try again shortly.",
+  "SESSION_REVOKED": "Your session has ended. Please sign in again.",
+  "TOKEN_INVALID": "Your sign-in token is invalid. Please sign in again.",
+  "TOKEN_REUSE_DETECTED": "For your security, this session was signed out. Please sign in again.",
+  "FEDERATION_INVALID_RESPONSE": "That address server returned an invalid response."
 }
