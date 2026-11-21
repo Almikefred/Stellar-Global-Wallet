@@ -36,7 +36,7 @@ export interface TransactionRecord {
 }
 
 export interface TransactionStore {
-  create(record: Omit<TransactionRecord, "createdAt" | "updatedAt" | "status">): Promise<TransactionRecord>;
+  create(record: Omit<TransactionRecord, "createdAt" | "updatedAt">): Promise<TransactionRecord>;
   get(hash: string): Promise<TransactionRecord | null>;
   update(hash: string, patch: Partial<TransactionRecord>): Promise<TransactionRecord>;
   listForAccount(accountId: string, limit?: number): Promise<TransactionRecord[]>;
@@ -142,7 +142,7 @@ export class PgTransactionStore implements TransactionStore {
   }
 }
 
-export class RedisTransactionPublisher {
+export class RedisTransactionPublisher implements TransactionPublisher {
   private client: RedisClientType | null = null;
   private channel: string;
 
@@ -172,10 +172,15 @@ export class RedisTransactionPublisher {
   }
 }
 
+/** Anything that can broadcast a status change (Redis in production, a no-op in dev). */
+export interface TransactionPublisher {
+  publish(hash: string, status: TransactionStatus, details?: { ledger?: number; errorMessage?: string }): Promise<void>;
+}
+
 export interface TransactionSubmitOptions {
   server: StellarSdk.Horizon.Server;
   store: TransactionStore;
-  publisher?: RedisTransactionPublisher;
+  publisher?: TransactionPublisher;
   pollingIntervalMs?: number;
   pollingTimeoutMs?: number;
   maxRetries?: number;
@@ -184,7 +189,7 @@ export interface TransactionSubmitOptions {
 export class TransactionSubmitter {
   private server: StellarSdk.Horizon.Server;
   private store: TransactionStore;
-  private publisher?: RedisTransactionPublisher;
+  private publisher?: TransactionPublisher;
   private pollingIntervalMs: number;
   private pollingTimeoutMs: number;
   private maxRetries: number;
@@ -224,7 +229,7 @@ export class TransactionSubmitter {
       if (result.successful) {
         await this.updateStatus(hash, "success", { ledger: result.ledger });
         await this.publisher?.publish(hash, "success", { ledger: result.ledger });
-        return await this.store.get(hash)!;
+        return await this.requireRecord(hash);
       } else {
         const error = new Error(`Transaction not successful: ${JSON.stringify(result)}`);
         throw error;
@@ -238,6 +243,12 @@ export class TransactionSubmitter {
       await this.publisher?.publish(hash, errorStatus, { errorMessage: err.message });
       throw this.translateError(err, errorStatus);
     }
+  }
+
+  private async requireRecord(hash: string): Promise<TransactionRecord> {
+    const record = await this.store.get(hash);
+    if (!record) throw new Error(`Transaction record ${hash} disappeared from the store`);
+    return record;
   }
 
   /**
@@ -262,7 +273,7 @@ export class TransactionSubmitter {
           errorMessage: tx.successful ? undefined : "Transaction failed on chain",
         });
         await this.publisher?.publish(hash, status, { ledger: tx.ledger_attr });
-        return await this.store.get(hash)!;
+        return await this.requireRecord(hash);
       } catch (err: any) {
         if (err.response?.status === 404) {
           // Not found yet, continue polling

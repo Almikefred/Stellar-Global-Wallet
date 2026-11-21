@@ -10,6 +10,8 @@ interface TokenPayload {
   sub: string;
   type: "access" | "refresh";
   auth_method?: AuthMethod;
+  /** Session the token belongs to, checked against the revocation list (#200). */
+  session_id?: string;
 }
 
 interface RefreshRecord {

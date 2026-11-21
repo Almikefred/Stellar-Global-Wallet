@@ -31,7 +31,7 @@ export async function jwtAuth(req: Request, res: Response, next: NextFunction) {
     }
 
     // #200 — check revocation on every request (cached in-memory for 1s)
-    const sessionId = (payload as Record<string, unknown>).session_id as string | undefined;
+    const sessionId = payload.session_id;
     if (sessionId) {
       const revoked = await sessionStore.isSessionRevoked(payload.sub, sessionId);
       if (revoked) {

@@ -97,22 +97,25 @@ function getPubSubClient(): RedisClientType {
     _pubsubClient.on("error", (err: Error) => {
       console.error("[soroban-cache] redis pubsub error", err.message);
     });
-    _pubsubClient.on("message", (channel: string, message: string) => {
-      if (channel === PUBSUB_CHANNEL) {
-        try {
-          const { contractId, timestamp } = JSON.parse(message);
-          console.log(`[soroban-cache] received invalidation for ${contractId} (broadcast at ${timestamp})`);
-          bustContractCache(contractId).catch(() => {
-            /* Swallow errors to prevent blocking the pub/sub handler */
-          });
-        } catch (err) {
-          console.error("[soroban-cache] failed to parse invalidation message", (err as Error).message);
-        }
-      }
-    });
   }
   return _pubsubClient;
 }
+
+/** Handles one invalidation message received from another instance. */
+function handleInvalidationMessage(message: string): void {
+  try {
+    const { contractId, timestamp } = JSON.parse(message);
+    console.log(`[soroban-cache] received invalidation for ${contractId} (broadcast at ${timestamp})`);
+    bustContractCache(contractId).catch(() => {
+      /* Swallow errors to prevent blocking the pub/sub handler */
+    });
+  } catch (err) {
+    console.error("[soroban-cache] failed to parse invalidation message", (err as Error).message);
+  }
+}
+
+/** Dedicated subscriber connection: a subscribed Redis client can't also publish. */
+let _subscriberClient: RedisClientType | null = null;
 
 /**
  * Starts listening for cross-instance invalidation messages.
@@ -120,11 +123,16 @@ function getPubSubClient(): RedisClientType {
  */
 export async function startInvalidationListener(): Promise<void> {
   try {
-    const pubsub = getPubSubClient();
-    if (!(pubsub as RedisClientType).isOpen) {
-      await pubsub.connect();
+    if (!_subscriberClient) {
+      _subscriberClient = getPubSubClient().duplicate();
+      _subscriberClient.on("error", (err: Error) => {
+        console.error("[soroban-cache] redis subscriber error", err.message);
+      });
     }
-    await pubsub.subscribe(PUBSUB_CHANNEL);
+    if (!_subscriberClient.isOpen) {
+      await _subscriberClient.connect();
+    }
+    await _subscriberClient.subscribe(PUBSUB_CHANNEL, handleInvalidationMessage);
     console.log("[soroban-cache] started listening for invalidation messages");
   } catch (err) {
     console.error("[soroban-cache] failed to start invalidation listener", (err as Error).message);

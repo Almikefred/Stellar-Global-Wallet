@@ -1,7 +1,7 @@
 import * as StellarSdk from "@stellar/stellar-sdk";
 import { config } from "../config";
 import { StellarService } from "./stellar";
-import { pool } from "./db";
+import { pool } from "../db";
 import { metrics } from "./metrics";
 
 export interface UnifiedActivityItem {
@@ -93,7 +93,7 @@ const LAG_ALERT_THRESHOLD = 100;
 const HORIZON_CACHE_TTL_MS = 60_000; // 60 seconds
 const horizonCache = new Map<
   string,
-  { items: Array<{ id: string; pagingToken: string; createdAt: string }>; expiry: number }
+  { items: Array<{ id: string; pagingToken: string; createdAt: string; cursor: string }>; expiry: number }
 >();
 
 /**
@@ -332,7 +332,7 @@ async function fetchAndProcessEvents(
         contractIds: [contractId],
       },
     ],
-    pagination: { limit: 1000 },
+    limit: 1000,
   });
 
   const events = res.events;
@@ -464,7 +464,7 @@ export function getActivityFeedMetrics(): { contractId: string | null } & Record
   // This is a placeholder that would need to be enhanced if metrics
   // need to be exposed across module boundaries
   return {
-    contractId: config.GLOBE_WALLET_CONTRACT_ID,
+    contractId: config.GLOBE_WALLET_CONTRACT_ID ?? null,
   };
 }
 
@@ -682,7 +682,7 @@ export async function getUnifiedActivityFeed(params: {
   // Decode the composite cursor
   const compositeCursor = decodeCompositeCursor(cursor);
 
-  const result = await mergeAndPaginate(publicKey, limit, compositeCursor, stellar);
+  const result = await mergeAndPaginate(publicKey, limit, compositeCursor ?? undefined, stellar);
 
   // Transform items to the expected format
   const transformed = result.items.map((item) => ({
