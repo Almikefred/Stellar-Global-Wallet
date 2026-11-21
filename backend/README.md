@@ -17,6 +17,19 @@ npm test
 npm run type-check
 ```
 
+The `.env.example` points at a real testnet contract with a demo user, so read
+endpoints work without deploying anything.
+
+## Design specs
+
+Proposed behaviour for in-progress hardening work:
+
+- [API keys: hashed storage, scopes and rotation](docs/api-keys.md) (#251)
+- [Pending multisig transactions: co-signing, validation and expiry](docs/multisig-pending-txs.md) (#248)
+- [setOptions builder safety: preventing lockout](docs/set-options-safety.md) (#249)
+- [Preferences API: conflict-safe updates and encryption at rest](docs/preferences.md) (#250)
+
+## Contract event indexer
 Postgres and Redis are expected at the URLs in `.env`; `docker compose up
 -d postgres redis` from the repo root starts both.
 
