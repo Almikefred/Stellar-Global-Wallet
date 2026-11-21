@@ -16,7 +16,8 @@
  *                                 WebPush subscription object,
  *     locale      VARCHAR(10)   — BCP-47 locale tag (e.g. "en-US"),
  *     created_at  TIMESTAMPTZ,
- *     last_seen_at TIMESTAMPTZ  — updated by POST when token already exists
+ *     last_seen_at TIMESTAMPTZ  — updated by POST when token already exists,
+ *     expires_at  TIMESTAMPTZ   — token expiration (null = never expires)
  *   )
  *
  * Tokens are scoped strictly to the authenticated account: every read/write
@@ -26,6 +27,7 @@
 
 import { Pool } from "pg";
 import { pool } from "../db";
+import { config } from "../config";
 
 export type Platform = "expo" | "web";
 
@@ -37,6 +39,18 @@ export interface Device {
   locale: string;
   createdAt: Date;
   lastSeenAt: Date;
+  expiresAt: Date | null;
+}
+
+export interface DeviceResponse {
+  id: string;
+  account: string;
+  platform: Platform;
+  token: string;
+  locale: string;
+  created_at: string;
+  last_seen_at: string;
+  expires_at: string | null;
 }
 
 /** Lazily creates the devices table (called by ensureAuditTable in db.ts). */
@@ -50,6 +64,7 @@ export async function ensureDevicesTable(db: Pool = pool): Promise<void> {
       locale       VARCHAR(10)  NOT NULL DEFAULT 'en',
       created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
       last_seen_at TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+      expires_at   TIMESTAMPTZ,
       UNIQUE (account, token)
     )
   `);
@@ -59,6 +74,9 @@ export async function ensureDevicesTable(db: Pool = pool): Promise<void> {
  * Upsert a device token for an account.  If the same (account, token) pair
  * already exists, only last_seen_at is updated — deduplicating registrations
  * across re-installs and app restarts without growing the table unboundedly.
+ *
+ * Expo tokens expire after EXPO_TOKEN_TTL_SECONDS (default 90 days). Web Push
+ * tokens are stored without expiration (expires_at = null).
  */
 export async function upsertDevice(
   account: string,
@@ -67,6 +85,11 @@ export async function upsertDevice(
   locale: string,
   db: Pool = pool
 ): Promise<Device> {
+  const expiresAt =
+    platform === "expo"
+      ? new Date(Date.now() + config.EXPO_TOKEN_TTL_SECONDS * 1000)
+      : null;
+
   const { rows } = await db.query<{
     id: string;
     account: string;
@@ -75,13 +98,14 @@ export async function upsertDevice(
     locale: string;
     created_at: Date;
     last_seen_at: Date;
+    expires_at: Date | null;
   }>(
-    `INSERT INTO devices (account, platform, token, locale)
-     VALUES ($1, $2, $3, $4)
+    `INSERT INTO devices (account, platform, token, locale, expires_at)
+     VALUES ($1, $2, $3, $4, $5)
      ON CONFLICT (account, token)
-     DO UPDATE SET last_seen_at = NOW(), locale = EXCLUDED.locale
+     DO UPDATE SET last_seen_at = NOW(), locale = EXCLUDED.locale, expires_at = EXCLUDED.expires_at
      RETURNING *`,
-    [account, platform, token, locale]
+    [account, platform, token, locale, expiresAt]
   );
   const row = rows[0];
   return {
@@ -92,6 +116,7 @@ export async function upsertDevice(
     locale: row.locale,
     createdAt: row.created_at,
     lastSeenAt: row.last_seen_at,
+    expiresAt: row.expires_at,
   };
 }
 
@@ -113,7 +138,7 @@ export async function deleteDevice(
 }
 
 /** Returns all registered devices for an account. */
-export async function listDevices(account: string, db: Pool = pool): Promise<Device[]> {
+export async function listDevices(account: string, db: Pool = pool): Promise<DeviceResponse[]> {
   const { rows } = await db.query<{
     id: string;
     account: string;
@@ -122,6 +147,7 @@ export async function listDevices(account: string, db: Pool = pool): Promise<Dev
     locale: string;
     created_at: Date;
     last_seen_at: Date;
+    expires_at: Date | null;
   }>(`SELECT * FROM devices WHERE account = $1 ORDER BY created_at DESC`, [account]);
   return rows.map((r) => ({
     id: r.id,
@@ -129,13 +155,53 @@ export async function listDevices(account: string, db: Pool = pool): Promise<Dev
     platform: r.platform,
     token: r.token,
     locale: r.locale,
-    createdAt: r.created_at,
-    lastSeenAt: r.last_seen_at,
+    created_at: r.created_at.toISOString(),
+    last_seen_at: r.last_seen_at.toISOString(),
+    expires_at: r.expires_at?.toISOString() ?? null,
   }));
 }
 
-/** Returns all devices for a set of accounts (used by notification workers). */
-export async function getDevicesForAccounts(
+/**
+ * Returns all devices for an account, filtering out expired or invalid tokens.
+ * Invalid tokens (DeviceNotRegistered from Expo) are pruned.
+ */
+export async function getValidDevicesForAccount(
+  account: string,
+  db: Pool = pool
+): Promise<DeviceResponse[]> {
+  const { rows } = await db.query<{
+    id: string;
+    account: string;
+    platform: Platform;
+    token: string;
+    locale: string;
+    created_at: Date;
+    last_seen_at: Date;
+    expires_at: Date | null;
+  }>(
+    `SELECT * FROM devices 
+     WHERE account = $1 
+       AND (expires_at IS NULL OR expires_at > NOW())
+     ORDER BY created_at DESC`,
+    [account]
+  );
+  return rows.map((r) => ({
+    id: r.id,
+    account: r.account,
+    platform: r.platform,
+    token: r.token,
+    locale: r.locale,
+    created_at: r.created_at.toISOString(),
+    last_seen_at: r.last_seen_at.toISOString(),
+    expires_at: r.expires_at?.toISOString() ?? null,
+  }));
+}
+
+/**
+ * Returns all devices for a set of accounts (used by notification workers).
+ * Filters out expired tokens.
+ */
+export async function getValidDevicesForAccounts(
   accounts: string[],
   db: Pool = pool
 ): Promise<Device[]> {
@@ -149,7 +215,13 @@ export async function getDevicesForAccounts(
     locale: string;
     created_at: Date;
     last_seen_at: Date;
-  }>(`SELECT * FROM devices WHERE account IN (${placeholders})`, accounts);
+    expires_at: Date | null;
+  }>(
+    `SELECT * FROM devices 
+     WHERE account IN (${placeholders})
+       AND (expires_at IS NULL OR expires_at > NOW())`,
+    accounts
+  );
   return rows.map((r) => ({
     id: r.id,
     account: r.account,
@@ -158,5 +230,38 @@ export async function getDevicesForAccounts(
     locale: r.locale,
     createdAt: r.created_at,
     lastSeenAt: r.last_seen_at,
+    expiresAt: r.expires_at,
   }));
+}
+
+/**
+ * Prunes invalid/expired tokens for an account. Returns the count of pruned tokens.
+ * Invalid tokens are identified by DeviceNotRegistered error codes.
+ */
+export async function pruneInvalidTokens(
+  account: string,
+  invalidTokens: string[],
+  db: Pool = pool
+): Promise<number> {
+  if (invalidTokens.length === 0) return 0;
+  const { rowCount } = await db.query(
+    `DELETE FROM devices WHERE account = $1 AND token = ANY($2)`,
+    [account, invalidTokens]
+  );
+  return (rowCount ?? 0);
+}
+/**
+ * Convert Device to DeviceResponse for API output.
+ */
+export function deviceToResponse(device: Device): DeviceResponse {
+  return {
+    id: device.id,
+    account: device.account,
+    platform: device.platform,
+    token: device.token,
+    locale: device.locale,
+    created_at: device.createdAt.toISOString(),
+    last_seen_at: device.lastSeenAt.toISOString(),
+    expires_at: device.expiresAt?.toISOString() ?? null,
+  };
 }

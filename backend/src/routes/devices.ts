@@ -18,7 +18,13 @@ import { body, param } from "express-validator";
 import { jwtAuth } from "../middleware/jwtAuth";
 import { assertValidRequest } from "../middleware/requestValidation";
 import { NotFoundError, ValidationError } from "../errors/appError";
-import { upsertDevice, deleteDevice, Platform } from "../services/deviceRegistry";
+import {
+  upsertDevice,
+  deleteDevice,
+  listDevices,
+  deviceToResponse,
+  Platform,
+} from "../services/deviceRegistry";
 
 export const devicesRouter = Router();
 
@@ -27,6 +33,19 @@ devicesRouter.use(jwtAuth);
 
 const EXPO_TOKEN_RE = /^ExponentPushToken\[.+\]$/;
 const LOCALE_RE = /^[a-z]{2,3}(-[A-Z]{2})?$/;
+
+devicesRouter.get("/", async (req, res, next) => {
+  try {
+    assertValidRequest(req);
+
+    const account = req.user!.sub;
+    const devices = await listDevices(account);
+
+    res.json({ devices });
+  } catch (err) {
+    next(err);
+  }
+});
 
 devicesRouter.post(
   "/",
@@ -82,7 +101,7 @@ devicesRouter.post(
       const account = req.user!.sub;
       const device = await upsertDevice(account, platform, token, locale);
 
-      res.status(201).json({ device });
+      res.status(201).json({ device: deviceToResponse(device) });
     } catch (err) {
       next(err);
     }
