@@ -1,7 +1,8 @@
 {
   "name": "@globe-wallet/sdk",
   "version": "0.1.0",
-  "description": "Typed client for the GlobeWallet Soroban contracts — works in Node, browsers and React Native. Wraps the generated contract bindings with a friendlier, versioned public API.",
+  "description": "Typed client for the GlobeWallet API and Soroban contracts. Works in Node, browsers and React Native.",
+  "license": "MIT",
   "type": "module",
   "main": "dist/index.js",
   "module": "dist/index.js",
@@ -16,6 +17,7 @@
     "dist",
     "README.md"
   ],
+  "sideEffects": false,
   "publishConfig": {
     "access": "public",
     "provenance": true
@@ -25,20 +27,18 @@
     "url": "git+https://github.com/Genghis-codes/Stellar-Global-Wallet.git",
     "directory": "packages/sdk"
   },
-  "license": "MIT",
   "scripts": {
     "build": "tsc",
     "type-check": "tsc --noEmit",
-    "lint": "eslint src --ext .ts",
-    "test": "node --test --import tsx tests/validate.test.ts tests/format.test.ts tests/lookalike.test.ts",
+    "test": "node --test --import tsx tests/validate.test.ts tests/format.test.ts tests/lookalike.test.ts tests/manifest.test.ts tests/client.test.ts",
     "test:smoke": "node --test --import tsx tests/smoke/preview-api.test.ts"
   },
   "dependencies": {
-    "@globe-wallet/bindings-globe-wallet": "0.0.0",
+    "@globe-wallet/bindings-globe-wallet": "^0.0.0",
     "@stellar/stellar-sdk": "^16.0.1"
   },
   "devDependencies": {
-    "typescript": "^5.4.2",
-    "tsx": "^4.7.1"
+    "tsx": "^4.7.1",
+    "typescript": "^5.6.0"
   }
 }

@@ -1,3 +1,8 @@
+import type { ErrorCode } from "./codes";
+
+export type { ErrorCode } from "./codes";
+export { ERROR_CODES, isErrorCode } from "./codes";
+
 export interface ValidationIssue {
   location?: string;
   message: string;
@@ -7,15 +12,30 @@ export interface ValidationIssue {
 }
 
 export interface AppErrorOptions {
-  code: string;
+  code: ErrorCode;
   details?: unknown;
+  requestId?: string;
   retryable?: boolean;
   status: number;
 }
 
+/**
+ * User-facing copy for an error code. Kept free of technical jargon so the
+ * web and mobile apps can render it directly. `message` is what the user
+ * sees; `action` is the suggested next step.
+ */
+export interface ErrorCodeCopy {
+  action: string;
+  message: string;
+  retryable: boolean;
+  status: number;
+  when: string;
+}
+
 export class AppError extends Error {
-  readonly code: string;
+  readonly code: ErrorCode;
   readonly details?: unknown;
+  readonly requestId?: string;
   readonly retryable?: boolean;
   readonly status: number;
 
@@ -24,8 +44,20 @@ export class AppError extends Error {
     this.name = new.target.name;
     this.code = options.code;
     this.details = options.details;
+    this.requestId = options.requestId;
     this.retryable = options.retryable;
     this.status = options.status;
+  }
+
+  /**
+   * Whether the caller should retry the request. Falls back to the HTTP
+   * status when the mapper did not set an explicit `retryable` flag.
+   */
+  isRetryable(): boolean {
+    if (typeof this.retryable === "boolean") {
+      return this.retryable;
+    }
+    return this.status === 429 || this.status >= 500;
   }
 }
 
@@ -36,14 +68,26 @@ export class InternalServerError extends AppError {
 }
 
 export class NotFoundError extends AppError {
-  constructor(message = "Not found", code = "NOT_FOUND", details?: unknown) {
+  constructor(message = "Not found", code: ErrorCode = "NOT_FOUND", details?: unknown) {
     super(message, { code, details, status: 404 });
   }
 }
 
 export class UnauthorizedError extends AppError {
-  constructor(message = "Unauthorized", code = "UNAUTHORIZED", details?: unknown) {
+  constructor(message = "Unauthorized", code: ErrorCode = "UNAUTHORIZED", details?: unknown) {
     super(message, { code, details, status: 401 });
+  }
+}
+
+export class ForbiddenError extends AppError {
+  constructor(message = "Forbidden", code: ErrorCode = "FORBIDDEN", details?: unknown) {
+    super(message, { code, details, status: 403 });
+  }
+}
+
+export class AccountMismatchError extends ForbiddenError {
+  constructor(message = "Authenticated account does not match the requested account", details?: unknown) {
+    super(message, "ACCOUNT_MISMATCH", details);
   }
 }
 
@@ -63,7 +107,7 @@ export class ValidationError extends AppError {
 }
 
 export class Sep7Error extends AppError {
-  constructor(message: string, code = "SEP7_INVALID_URI", details?: unknown) {
+  constructor(message: string, code: ErrorCode = "SEP7_INVALID_URI", details?: unknown) {
     super(message, { code, details, status: 400 });
   }
 }
@@ -72,7 +116,7 @@ export class HorizonError extends AppError {
   constructor(
     message: string,
     options: {
-      code: string;
+      code: ErrorCode;
       details?: unknown;
       retryable?: boolean;
       status?: number;
@@ -87,6 +131,229 @@ export class HorizonError extends AppError {
   }
 }
 
+/**
+ * Raised when a requested `setOptions` change would make the account's
+ * thresholds unreachable (e.g. sum of signer weights below a threshold, or
+ * master weight 0 with no other signers). This is a deny-by-default guard so
+ * a client can never build an XDR that permanently locks the account.
+ */
+export class LockoutError extends AppError {
+  readonly warnings: string[];
+
+  constructor(message: string, warnings: string[] = [], details?: unknown) {
+    super(message, {
+      code: "SET_OPTIONS_LOCKOUT",
+      details,
+      status: 422,
+    });
+    this.warnings = warnings;
+  }
+}
+
 export function isAppError(error: unknown): error is AppError {
   return error instanceof AppError;
+}
+
+/**
+ * User-facing copy for error codes. Messages are intentionally jargon-free:
+ * `tx_bad_seq` becomes "Something changed, please try again" rather than
+ * leaking Horizon internals.
+ *
+ * Not every code has bespoke copy yet; use `getErrorCopy`, which falls back
+ * to generic copy derived from the HTTP status.
+ */
+export const ERROR_CODE_COPY: Partial<Record<ErrorCode, ErrorCodeCopy>> = {
+  INTERNAL_ERROR: {
+    status: 500,
+    retryable: true,
+    when: "An unexpected failure occurred on the server.",
+    message: "Something went wrong on our side.",
+    action: "Wait a moment and try again. If it keeps happening, contact support.",
+  },
+  NOT_FOUND: {
+    status: 404,
+    retryable: false,
+    when: "The requested resource does not exist.",
+    message: "We couldn't find what you were looking for.",
+    action: "Check the link or go back and pick a different item.",
+  },
+  UNAUTHORIZED: {
+    status: 401,
+    retryable: false,
+    when: "The request is missing valid authentication.",
+    message: "Please sign in to continue.",
+    action: "Sign in again and retry.",
+  },
+  VALIDATION_ERROR: {
+    status: 400,
+    retryable: false,
+    when: "One or more inputs failed validation.",
+    message: "Some of the details you entered aren't quite right.",
+    action: "Review the highlighted fields and try again.",
+  },
+  INSUFFICIENT_RESERVE: {
+    status: 422,
+    retryable: false,
+    when: "The account lacks enough XLM to meet the required reserve.",
+    message: "You don't have enough XLM available for this change.",
+    action: "Add XLM to the account or remove another trustline or signer.",
+  },
+  ASSET_ISSUER_NOT_FOUND: {
+    status: 404,
+    retryable: false,
+    when: "The asset issuer account does not exist on the network.",
+    message: "We couldn't find the issuer for this asset.",
+    action: "Check the asset issuer address and try again.",
+  },
+  ASSET_ALREADY_ADDED: {
+    status: 409,
+    retryable: false,
+    when: "The wallet already tracks this asset.",
+    message: "This asset is already added.",
+    action: "Choose a different asset.",
+  },
+  ASSET_HAS_ACTIVE_SPEND_LIMIT: {
+    status: 409,
+    retryable: false,
+    when: "An asset cannot be removed while it has an active spend limit.",
+    message: "This asset still has a spend limit.",
+    action: "Remove the spend limit before removing the asset.",
+  },
+  TRUSTLINE_NOT_FOUND: {
+    status: 404,
+    retryable: false,
+    when: "The account does not have a trustline for this asset.",
+    message: "This asset isn't currently added to the account.",
+    action: "Refresh the account's assets and try again.",
+  },
+  TRUSTLINE_HAS_BALANCE: {
+    status: 409,
+    retryable: false,
+    when: "A trustline cannot be removed while its asset balance is non-zero.",
+    message: "This trustline still holds an asset balance.",
+    action: "Send or trade the remaining balance before removing the trustline.",
+  },
+  PAYLOAD_TOO_LARGE: {
+    status: 413,
+    retryable: false,
+    when: "The request body exceeds the configured size limit.",
+    message: "That file or request is too large.",
+    action: "Reduce the size and try again.",
+  },
+  SEP7_INVALID_URI: {
+    status: 400,
+    retryable: false,
+    when: "A SEP-7 payment URI could not be parsed.",
+    message: "That payment link isn't valid.",
+    action: "Ask the sender for a fresh link.",
+  },
+  SET_OPTIONS_LOCKOUT: {
+    status: 422,
+    retryable: false,
+    when: "A setOptions change would lock the account out.",
+    message: "This change would lock you out of your account.",
+    action: "Adjust the signers or thresholds and try again.",
+  },
+  REFRESH_TOKEN_INVALID: {
+    status: 401,
+    retryable: false,
+    when: "The refresh token is missing, expired, or revoked.",
+    message: "Your session has expired.",
+    action: "Sign in again to continue.",
+  },
+  LOGIN_RATE_LIMITED: {
+    status: 429,
+    retryable: true,
+    when: "Too many sign-in attempts were made in a short window.",
+    message: "Too many attempts. Please slow down.",
+    action: "Wait a minute, then try signing in again.",
+  },
+  ROUTE_NOT_FOUND: {
+    status: 404,
+    retryable: false,
+    when: "No route matches the requested path.",
+    message: "That page doesn't exist.",
+    action: "Check the address or return to the home screen.",
+  },
+  HORIZON_TX_BAD_SEQUENCE: {
+    status: 409,
+    retryable: true,
+    when: "The transaction sequence number is out of date.",
+    message: "Something changed, please try again.",
+    action: "Retry the operation to pick up the latest state.",
+  },
+  HORIZON_TX_INSUFFICIENT_FEE: {
+    status: 409,
+    retryable: true,
+    when: "The transaction fee was below the network minimum.",
+    message: "The network is busy right now.",
+    action: "Try again in a moment.",
+  },
+  HORIZON_TX_INSUFFICIENT_BALANCE: {
+    status: 422,
+    retryable: false,
+    when: "The account lacks funds for the transaction.",
+    message: "You don't have enough funds for this.",
+    action: "Add funds or lower the amount and try again.",
+  },
+  HORIZON_OP_NO_ACCOUNT: {
+    status: 422,
+    retryable: false,
+    when: "The source account does not exist on the network.",
+    message: "That account isn't active yet.",
+    action: "Fund the account first, then try again.",
+  },
+  HORIZON_TX_BAD_AUTH: {
+    status: 403,
+    retryable: false,
+    when: "The transaction signatures are missing or invalid.",
+    message: "We couldn't verify this transaction.",
+    action: "Re-authorize and try again.",
+  },
+  HORIZON_UNAVAILABLE: {
+    status: 502,
+    retryable: true,
+    when: "Horizon could not be reached or returned an error.",
+    message: "The Stellar network is temporarily unavailable.",
+    action: "Wait a moment and try again.",
+  },
+  SOROBAN_SIMULATION_FAILED: {
+    status: 502,
+    retryable: true,
+    when: "A Soroban contract simulation failed.",
+    message: "We couldn't prepare this contract action.",
+    action: "Try again. If it persists, contact support.",
+  },
+  CONTRACT_ERROR: {
+    status: 422,
+    retryable: false,
+    when: "A Soroban contract returned an error result.",
+    message: "The contract couldn't complete this action.",
+    action: "Review the details and try again.",
+  },
+  CONTRACT_INVOCATION_FAILED: {
+    status: 502,
+    retryable: true,
+    when: "A Soroban contract invocation failed to submit.",
+    message: "We couldn't submit this contract action.",
+    action: "Try again in a moment.",
+  },
+};
+
+/** Copy for `code`, or generic copy for its status when none is written yet. */
+export function getErrorCopy(code: ErrorCode, status = 500): ErrorCodeCopy {
+  const copy = ERROR_CODE_COPY[code];
+  if (copy) {
+    return copy;
+  }
+  if (status >= 500) {
+    return { ...(ERROR_CODE_COPY.INTERNAL_ERROR as ErrorCodeCopy), status };
+  }
+  return {
+    status,
+    retryable: status === 429,
+    when: "The request could not be completed.",
+    message: "We couldn't complete that request.",
+    action: "Check the details and try again.",
+  };
 }

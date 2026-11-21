@@ -1,0 +1,20 @@
+[package]
+name = "account-factory"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+# Typed client for the freshly deployed account's `init`. Same LTO note as
+# globe-wallet -> token-wrapper: the release profile strips the dependency's
+# own exports from this crate's WASM.
+smart-account = { path = "../smart-account" }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+
+[features]
+testutils = ["soroban-sdk/testutils"]

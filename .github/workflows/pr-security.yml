@@ -1,0 +1,67 @@
+# Scans every pull request for malicious or vulnerable
+# dependencies (malware scanning and removal: pr-malware-guard.yml) the moment it is opened or updated.
+#
+# Scans that only *read* files run on `pull_request_target`, which starts
+# immediately even for fork PRs from first-time contributors (no "Approve
+# and run" click needed). They never execute code from the PR: the PR is
+# checked out into a separate folder, without credentials, and only
+# scanned. The install-based signature check executes npm against the
+# PR's files, so it lives in pr-package-signatures.yml on `pull_request`.
+name: PR Security Scan
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-security-${{ github.event_name }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  dependency-review:
+    name: Malicious & vulnerable dependencies
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      # Fails if the PR adds a package with a GitHub advisory, including
+      # malware advisories (packages known to be malicious). Compares the
+      # dependency graphs of base and head through the API; no checkout.
+      - uses: actions/dependency-review-action@v4
+        with:
+          base-ref: ${{ github.event.pull_request.base.sha }}
+          head-ref: ${{ github.event.pull_request.head.sha }}
+          fail-on-severity: high
+          comment-summary-in-pr: on-failure
+
+  lockfile:
+    name: Lockfile sources
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out PR files (scan only, never executed)
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr
+          persist-credentials: false
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      # Every package must come from the npm registry over HTTPS with an
+      # integrity hash, so a PR can't swap a dependency for a tarball on
+      # someone else's server. Runs outside the PR folder so the PR's own
+      # .npmrc can't change how npx behaves.
+      - name: Check lockfile sources
+        working-directory: ${{ runner.temp }}
+        run: |
+          npx --yes lockfile-lint@4 \
+            --path "$GITHUB_WORKSPACE/pr/package-lock.json" \
+            --type npm --allowed-hosts npm --validate-https --validate-integrity

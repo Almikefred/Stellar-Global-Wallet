@@ -4,8 +4,10 @@ import {
   InternalServerError,
   PayloadTooLargeError,
   isAppError,
+  isErrorCode,
 } from "../errors/appError";
 import { SorobanTransactionError } from "../services/sorobanErrors";
+import { getActiveTraceId } from "../telemetry";
 
 /**
  * Pre-existing gap found while wiring up the per-route JSON body limits
@@ -54,7 +56,11 @@ function toAppError(error: unknown): AppError {
     const status = clientErrorStatus(error);
     if (status !== null) {
       const type = (error as { type?: unknown }).type;
-      const code = typeof type === "string" ? type.toUpperCase().replace(/[^A-Z0-9]+/g, "_") : "REQUEST_ERROR";
+      // Only surface codes from the published catalogue; a library's own
+      // error type (e.g. body-parser's "entity.parse.failed") is not part
+      // of the API contract, so it collapses to REQUEST_ERROR.
+      const derived = typeof type === "string" ? type.toUpperCase().replace(/[^A-Z0-9]+/g, "_") : "";
+      const code = isErrorCode(derived) ? derived : "REQUEST_ERROR";
       return new AppError(error.message, { code, status });
     }
     return new InternalServerError(error.message);
@@ -63,34 +69,77 @@ function toAppError(error: unknown): AppError {
   return new InternalServerError();
 }
 
-function toErrorBody(error: AppError) {
-  const body: Record<string, unknown> = {
+/**
+ * Single error envelope for every non-2xx response:
+ * `{ error: { code, message, details?, retryable?, requestId } }`.
+ *
+ * `requestId` is read from the response header set by the request-id
+ * middleware (falling back to the request header) so clients can correlate
+ * a failure with server logs. Stack traces are never included.
+ */
+function toErrorBody(error: AppError, requestId?: string, traceId?: string) {
+  const inner: Record<string, unknown> = {
     code: error.code,
-    error: error.message,
+    message: error.message,
   };
 
   if (error.details !== undefined) {
-    body.details = error.details;
+    inner.details = error.details;
   }
 
   if (error.retryable !== undefined) {
-    body.retryable = error.retryable;
+    inner.retryable = error.retryable;
   }
 
   if (error instanceof SorobanTransactionError) {
-    body.hash = error.hash;
+    inner.hash = error.hash;
   }
 
-  return body;
+  if (requestId) {
+    inner.requestId = requestId;
+  }
+
+  if (traceId) {
+    inner.traceId = traceId;
+  }
+
+  return { error: inner };
+}
+
+function resolveRequestId(req: Request, res: Response): string | undefined {
+  const fromResponse =
+    typeof res.getHeader === "function" ? res.getHeader("x-request-id") : undefined;
+  if (typeof fromResponse === "string" && fromResponse.length > 0) {
+    return fromResponse;
+  }
+  const fromRequest =
+    typeof req.header === "function" ? req.header("x-request-id") : undefined;
+  return fromRequest && fromRequest.length > 0 ? fromRequest : undefined;
+}
+
+function resolveTraceId(req: Request, res: Response): string | undefined {
+  const activeTrace = getActiveTraceId();
+  if (activeTrace) return activeTrace;
+  if (req.traceId) return req.traceId;
+  const fromResponse =
+    typeof res.getHeader === "function" ? res.getHeader("x-trace-id") : undefined;
+  if (typeof fromResponse === "string" && fromResponse.length > 0) {
+    return fromResponse;
+  }
+  const fromRequest =
+    typeof req.header === "function" ? req.header("x-trace-id") : undefined;
+  return typeof fromRequest === "string" && fromRequest.length > 0 ? fromRequest : undefined;
 }
 
 export function errorHandler(
   err: unknown,
-  _req: Request,
+  req: Request,
   res: Response,
   _next: NextFunction
 ) {
   console.error(err);
   const error = toAppError(err);
-  res.status(error.status).json(toErrorBody(error));
+  const requestId = resolveRequestId(req, res);
+  const traceId = resolveTraceId(req, res);
+  res.status(error.status).json(toErrorBody(error, requestId, traceId));
 }

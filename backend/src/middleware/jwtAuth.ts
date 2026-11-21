@@ -1,9 +1,17 @@
 import { Request, Response, NextFunction } from "express";
+import { TokenExpiredError } from "jsonwebtoken";
 import { verifyAccessToken } from "../utils/jwt";
 import { UnauthorizedError } from "../errors/appError";
+import { sessionStore } from "../services/sessionStore";
 
-export function jwtAuth(req: Request, res: Response, next: NextFunction) {
+export async function jwtAuth(req: Request, res: Response, next: NextFunction) {
   const header = req.header("Authorization");
+  // No credential at all: tell the client to sign in. A legacy x-api-key
+  // (#40) or a non-Bearer header is a malformed credential instead.
+  if (!header && !req.header("x-api-key")) {
+    next(new UnauthorizedError("Authentication required", "TOKEN_MISSING"));
+    return;
+  }
   if (!header?.startsWith("Bearer ")) {
     next(
       new UnauthorizedError(
@@ -21,9 +29,26 @@ export function jwtAuth(req: Request, res: Response, next: NextFunction) {
       next(new UnauthorizedError("Invalid token type", "AUTH_TOKEN_TYPE_INVALID"));
       return;
     }
+
+    // #200 — check revocation on every request (cached in-memory for 1s)
+    const sessionId = (payload as Record<string, unknown>).session_id as string | undefined;
+    if (sessionId) {
+      const revoked = await sessionStore.isSessionRevoked(payload.sub, sessionId);
+      if (revoked) {
+        next(new UnauthorizedError("Session has been revoked", "SESSION_REVOKED"));
+        return;
+      }
+    }
+
     req.user = { sub: payload.sub };
     next();
-  } catch {
-    next(new UnauthorizedError("Invalid or expired token", "AUTH_TOKEN_INVALID"));
+  } catch (err) {
+    // Clients refresh only on TOKEN_EXPIRED; anything else (bad signature,
+    // malformed token) means signing in again.
+    if (err instanceof TokenExpiredError) {
+      next(new UnauthorizedError("Access token expired", "TOKEN_EXPIRED"));
+      return;
+    }
+    next(new UnauthorizedError("Invalid token", "AUTH_TOKEN_INVALID"));
   }
 }

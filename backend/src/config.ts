@@ -1,10 +1,75 @@
 import { z } from "zod";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
+// #41 — CORS origins are validated at startup so a typo (trailing space,
+// missing scheme) fails fast with a clear message instead of silently
+// blocking the web app at request time. Each comma-separated entry is
+// trimmed and must parse as a URL. `exp://` origins (Expo dev) are kept
+// supported — `new URL()` accepts them.
+const corsOriginSchema = z
+  .string()
+  .min(1)
+  .transform((raw, ctx) => {
+    const origins = raw
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0);
+
+    if (origins.length === 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "CORS_ORIGIN must contain at least one origin",
+      });
+      return z.NEVER;
+    }
+
+    for (const origin of origins) {
+      try {
+        // eslint-disable-next-line no-new
+        new URL(origin);
+      } catch {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `CORS_ORIGIN entry "${origin}" is not a valid URL (expected e.g. https://app.globewallet.app or exp://192.168.1.10:8081)`,
+        });
+        return z.NEVER;
+      }
+    }
+
+    return origins;
+  });
+
+// #41 — opt-in regex for preview deploys (Vercel/Netlify). Validated as a
+// compilable RegExp so a bad pattern fails startup rather than throwing on
+// the first request.
+const corsOriginRegexSchema = z
+  .string()
+  .min(1)
+  .optional()
+  .transform((raw, ctx) => {
+    if (raw === undefined) return undefined;
+    try {
+      return new RegExp(raw);
+    } catch {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `CORS_ORIGIN_REGEX is not a valid regular expression: ${raw}`,
+      });
+      return z.NEVER;
+    }
+  });
 
 const envSchema = z.object({
+  NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
+  // Graceful shutdown timeout in milliseconds (#220).
+  // Time allotted to finish in-flight requests, drain submissions, and release locks.
+  SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().positive().default(25000),
   PORT: z.coerce.number().int().positive().default(4000),
   HORIZON_URL: z.string().url().default("https://horizon-testnet.stellar.org"),
   NETWORK_PASSPHRASE: z.string().min(1),
-  CORS_ORIGIN: z.string().min(1),
+  CORS_ORIGIN: corsOriginSchema,
+  CORS_ORIGIN_REGEX: corsOriginRegexSchema,
   DATABASE_URL: z.string().min(1),
   REDIS_URL: z.string().min(1),
   JWT_SECRET: z.string().min(1),
@@ -33,6 +98,14 @@ const envSchema = z.object({
       "must be a valid Soroban contract StrKey (C followed by 55 uppercase alphanumeric characters)"
     )
     .optional(),
+  TOKEN_WRAPPER_CONTRACT_ID: z
+    .string()
+    .regex(
+      /^C[A-Z0-9]{55}$/,
+      "must be a valid Soroban contract StrKey (C followed by 55 uppercase alphanumeric characters)"
+    )
+    .optional(),
+  MIN_CLIENT_VERSION: z.string().min(1).default("0.1.0"),
 
   // Number of trusted reverse-proxy hops in front of this service, passed
   // straight to Express's `trust proxy` setting (see src/app.ts). This
@@ -82,14 +155,30 @@ const envSchema = z.object({
   // flagged "unknown_asset" until explicitly added here.
   VERIFIED_ASSETS: z.string().default(""),
 
-  // #77 — contract event indexer. The worker polls Soroban RPC getEvents
-  // filtered by GLOBE_WALLET_CONTRACT_ID and persists a cursor in the
-  // indexer_state table so restarts resume where they left off. These knobs
-  // let ops tune polling without a deploy.
+  // Which network this deployment talks to. Selects the curated verified-
+  // asset list (backend/data/verified-assets.<network>.json, #54), the
+  // default USDC issuer used as the USD quote asset for prices (#55), and
+  // whether testnet-only routes (Friendbot, #69) are mounted.
+  STELLAR_NETWORK: z.enum(["testnet", "mainnet"]).default("testnet"),
+
+  // #55 — price oracle. Comma-separated provider order; the first provider
+  // that returns a price for an asset wins, later ones are fallbacks.
+  PRICE_PROVIDERS: z.string().default("stellar_dex,coingecko"),
+  // TTL for spot prices (single and batch lookups share one cache).
+  PRICE_CACHE_TTL_SECONDS: z.coerce.number().int().positive().default(30),
+  // Issuer of the USDC asset used as the USD quote on the Stellar DEX.
+  // Defaults to Circle's issuer for STELLAR_NETWORK (see services/price/usdQuote.ts).
+  PRICE_USDC_ISSUER: z.string().optional(),
+  COINGECKO_BASE_URL: z.string().url().default("https://api.coingecko.com/api/v3"),
+  // Optional CoinGecko demo/pro API key, sent as x-cg-demo-api-key.
+  COINGECKO_API_KEY: z.string().optional(),
+
+  // #77 — contract event indexer settings. The indexer worker itself is not
+  // implemented yet (the #141 PR only added config and schema); these are
+  // reserved so its deployment config can be prepared ahead of it.
   //
   // Ledger to start indexing from when no cursor exists yet (e.g. the
-  // contract's deploy ledger). `npm run indexer:backfill -- --from-ledger N`
-  // overrides this for a one-off backfill run.
+  // contract's deploy ledger).
   INDEXER_START_LEDGER: z.coerce.number().int().min(0).default(0),
   // How often the worker polls getEvents, in milliseconds.
   INDEXER_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(5000),
@@ -100,6 +189,75 @@ const envSchema = z.object({
   // the worker logs an alert because the retention gap means events were
   // permanently lost and a backfill from an archive source is required.
   INDEXER_RETENTION_GAP_LEDGERS: z.coerce.number().int().positive().default(120960),
+
+  // SEP-10 web authentication (GET /api/v1/auth/challenge, POST /token).
+  // SEP10_SIGNING_SECRET is the server's S... key that signs challenges;
+  // the SEP-10 routes answer 503 until it is set. HOME_DOMAIN and
+  // WEB_AUTH_DOMAIN must match what the wallet's stellar.toml advertises.
+  SEP10_SIGNING_SECRET: z
+    .string()
+    .regex(/^S[A-Z2-7]{55}$/, "must be a Stellar secret seed (S...)")
+    .optional(),
+  HOME_DOMAIN: z.string().min(1).default("globewallet.app"),
+  WEB_AUTH_DOMAIN: z.string().min(1).default("globewallet.app"),
+
+  // Fiat conversion for transaction history (see services/fx.ts and
+  // docs/transaction-history.md). Rates move slowly, so cache for an hour.
+  FX_API_URL: z.string().url().default("https://open.er-api.com/v6/latest/USD"),
+  FX_CACHE_TTL_MS: z.coerce.number().int().positive().default(60 * 60 * 1000),
+  // Upper bound on operations examined per filtered history page (#58).
+  HISTORY_SCAN_CAP: z.coerce.number().int().positive().max(10000).default(1000),
+
+  // #185 — TTL keeper job. Disabled unless a funded fee-payer secret is set;
+  // the key only pays fees for the permissionless `extend_user_ttl` /
+  // RestoreFootprint transactions and never needs any wallet's authority.
+  TTL_KEEPER_SECRET_KEY: z
+    .string()
+    .regex(/^S[A-Z2-7]{55}$/, "must be a Stellar secret seed (S...)")
+    .optional(),
+  // How often the keeper sweeps active wallets (default: every 6 hours,
+  // well inside the contract's 1-day KEEPER_INTERVAL_LEDGERS).
+  TTL_KEEPER_INTERVAL_MS: z.coerce.number().int().positive().default(6 * 60 * 60 * 1000),
+  // Alert when an entry has fewer than this many ledgers left (~3 days).
+  TTL_KEEPER_ALERT_LEDGERS: z.coerce.number().int().positive().default(17_280 * 3),
+  // A wallet is "active" if one of its devices was seen within this many days.
+  TTL_KEEPER_ACTIVE_DAYS: z.coerce.number().int().positive().default(90),
+
+  // #185/#186 — optional ops webhook (Slack/Discord/PagerDuty-compatible JSON
+  // POST) for near-expiry and upgrade-proposed alerts. Alerts are always
+  // logged; the webhook is an extra channel.
+  OPS_ALERT_WEBHOOK_URL: z.string().url().optional(),
+
+  // #186 — upgrade watcher poll interval.
+  UPGRADE_WATCHER_POLL_MS: z.coerce.number().int().positive().default(30_000),
+
+  // #16 — interactive API docs (Swagger UI at /api/docs, raw spec at
+  // /api/openapi.json). Defaults to enabled outside production and disabled
+  // in production so a prod build never exposes docs unless explicitly
+  // opted in via ENABLE_API_DOCS=true.
+  ENABLE_API_DOCS: z
+    .enum(["true", "false"])
+    .optional()
+    .transform((v) => (v === undefined ? process.env.NODE_ENV !== "production" : v === "true")),
 });
 
 export const config = envSchema.parse(process.env);
+
+// Read the package version once at boot. Resolved relative to this file so it
+// works both under ts-node (src/) and compiled output (dist/).
+function readPackageVersion(): string {
+  try {
+    const pkgPath = join(__dirname, "..", "package.json");
+    const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as { version?: string };
+    return pkg.version ?? "1.0.0";
+  } catch {
+    return "1.0.0";
+  }
+}
+
+const packageVersion = readPackageVersion();
+const [, packageMinor = "0"] = packageVersion.split(".");
+
+// API major version is fixed by the URL prefix; minor tracks package.json.
+export const API_MAJOR_VERSION = 1;
+export const API_VERSION = `${API_MAJOR_VERSION}.${packageMinor}`;

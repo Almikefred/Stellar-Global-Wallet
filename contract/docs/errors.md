@@ -5,7 +5,7 @@
 Soroban smart contract errors are emitted as numeric contract errors: `Error(Contract, #N)`.
 To deliver an accessible and reliable user experience, the frontend and API layers must not expose raw numeric codes or internal stack traces to users. Instead, each error discriminant maps to:
 1. A strongly-typed Rust variant in [`contracts/globe-wallet/src/lib.rs`](../contracts/globe-wallet/src/lib.rs)
-2. A numeric discriminant (1001..1038)
+2. A numeric discriminant (1001..1039)
 3. A stable, machine-readable API code (e.g. `SPEND_LIMIT_EXCEEDED`)
 4. Clear, localized UI copy explaining the issue and recovery action to the user
 
@@ -62,8 +62,64 @@ flowchart LR
 | 1036 | `TokenTransferFailed` | `TOKEN_TRANSFER_FAILED` | The token transfer failed. Please check allowance and account balance. | Ensure adequate token balance and an active token allowance (`approve`). |
 | 1037 | `UpgradeDelayTooShort` | `UPGRADE_DELAY_TOO_SHORT` | The proposed upgrade timelock delay is below the minimum required ledgers. | Upgrade delay must be at least 17,280 ledgers (~24 hours). |
 | 1038 | `RecoveryDelayTooShort` | `RECOVERY_DELAY_TOO_SHORT` | The recovery timelock delay is below the minimum required ledgers. | Recovery delay must be at least 17,280 ledgers (~24 hours). |
+| 1039 | `SendsPaused` | `SENDS_PAUSED` | Sending is temporarily paused while an incident is handled. | Wait for the admin to call `unpause_sends`. Recovery and admin changes still work. |
 
 ## Synchronization Guarantee
 
 A synchronization test is enforced in [`backend/tests/services/contracts/globeWalletErrors.test.ts`](../../backend/tests/services/contracts/globeWalletErrors.test.ts).
 If any new variant is added to `pub enum WalletError` in Rust without a corresponding entry in `backend/src/services/contracts/globeWalletErrors.ts`, CI fails immediately.
+
+<!-- BEGIN GENERATED ERROR CODES -->
+| Code | Variant | API Code |
+|:---|:---|:---|
+| 1001 | `AlreadyInitialized` | `ALREADY_INITIALIZED` |
+| 1002 | `NotInitialized` | `NOT_INITIALIZED` |
+| 1003 | `Unauthorized` | `UNAUTHORIZED` |
+| 1004 | `AssetAlreadyAdded` | `ASSET_ALREADY_ADDED` |
+| 1005 | `AssetNotFound` | `ASSET_NOT_FOUND` |
+| 1006 | `InvalidSpendLimit` | `INVALID_SPEND_LIMIT` |
+| 1007 | `SpendLimitExceeded` | `SPEND_LIMIT_EXCEEDED` |
+| 1008 | `NoAssetsProvided` | `NO_ASSETS_PROVIDED` |
+| 1009 | `NoPendingAdmin` | `NO_PENDING_ADMIN` |
+| 1010 | `SpendOverflow` | `SPEND_OVERFLOW` |
+| 1011 | `AssetLimitExceeded` | `ASSET_LIMIT_EXCEEDED` |
+| 1012 | `MaxAssetsReached` | `MAX_ASSETS_REACHED` |
+| 1013 | `UpgradeAlreadyPending` | `UPGRADE_ALREADY_PENDING` |
+| 1014 | `UpgradeNotPending` | `UPGRADE_NOT_PENDING` |
+| 1015 | `UpgradeHashMismatch` | `UPGRADE_HASH_MISMATCH` |
+| 1016 | `UpgradeNotReady` | `UPGRADE_NOT_READY` |
+| 1017 | `UpgradeFailed` | `UPGRADE_FAILED` |
+| 1018 | `GuardianAlreadyAdded` | `GUARDIAN_ALREADY_ADDED` |
+| 1019 | `GuardianNotFound` | `GUARDIAN_NOT_FOUND` |
+| 1020 | `InvalidRecoveryThreshold` | `INVALID_RECOVERY_THRESHOLD` |
+| 1021 | `NotEnoughGuardians` | `NOT_ENOUGH_GUARDIANS` |
+| 1022 | `RecoveryNotConfigured` | `RECOVERY_NOT_CONFIGURED` |
+| 1023 | `RecoveryAlreadyPending` | `RECOVERY_ALREADY_PENDING` |
+| 1024 | `NoPendingRecovery` | `NO_PENDING_RECOVERY` |
+| 1025 | `AlreadyApproved` | `ALREADY_APPROVED` |
+| 1026 | `ApprovalNotFound` | `APPROVAL_NOT_FOUND` |
+| 1027 | `RecoveryNotReady` | `RECOVERY_NOT_READY` |
+| 1028 | `RecoveryNotQuorate` | `RECOVERY_NOT_QUORATE` |
+| 1029 | `InvalidAssetInfo` | `INVALID_ASSET_INFO` |
+| 1030 | `UpgradeWasmNotUploaded` | `UPGRADE_WASM_NOT_UPLOADED` |
+| 1031 | `GuardianLimitExceeded` | `GUARDIAN_LIMIT_EXCEEDED` |
+| 1032 | `RecoveryNewAdminUnchanged` | `RECOVERY_NEW_ADMIN_UNCHANGED` |
+| 1033 | `InvalidAssetCode` | `INVALID_ASSET_CODE` |
+| 1034 | `TokenNotAllowed` | `TOKEN_NOT_ALLOWED` |
+| 1035 | `TokenWrapperNotSet` | `TOKEN_WRAPPER_NOT_SET` |
+| 1036 | `TokenTransferFailed` | `TOKEN_TRANSFER_FAILED` |
+| 1037 | `UpgradeDelayTooShort` | `UPGRADE_DELAY_TOO_SHORT` |
+| 1038 | `RecoveryDelayTooShort` | `RECOVERY_DELAY_TOO_SHORT` |
+| 1039 | `ContractPaused` | `CONTRACT_PAUSED` |
+| 1040 | `TokenNotStellarAsset` | `TOKEN_NOT_STELLAR_ASSET` |
+| 1041 | `AllowlistProposalNotFound` | `ALLOWLIST_PROPOSAL_NOT_FOUND` |
+| 1042 | `AllowlistNotReady` | `ALLOWLIST_NOT_READY` |
+| 1043 | `AllowlistAlreadyPending` | `ALLOWLIST_ALREADY_PENDING` |
+| 1044 | `SendsPaused` | `SENDS_PAUSED` |
+| 1045 | `SpendLimitArchived` | `SPEND_LIMIT_ARCHIVED` |
+| 1046 | `NoPendingSpendLimit` | `NO_PENDING_SPEND_LIMIT` |
+| 1047 | `GuardianChangePending` | `GUARDIAN_CHANGE_PENDING` |
+| 1048 | `NoPendingGuardianChange` | `NO_PENDING_GUARDIAN_CHANGE` |
+| 1049 | `GuardianChangeNotReady` | `GUARDIAN_CHANGE_NOT_READY` |
+| 1050 | `RecoveryCancelNotAllowed` | `RECOVERY_CANCEL_NOT_ALLOWED` |
+<!-- END GENERATED ERROR CODES -->

@@ -1,0 +1,78 @@
+# Prometheus Alerting and Recording Rules for GlobeWallet SLOs (#222)
+groups:
+  - name: globewallet_slo_recordings
+    interval: 30s
+    rules:
+      # Submission success rate SLI (1h, 6h, 1d, 3d rolling windows)
+      - record: job:wallet_submissions_total:rate1h
+        expr: sum(rate(wallet_submissions_total[1h]))
+      - record: job:wallet_submissions_errors:rate1h
+        expr: sum(rate(wallet_submissions_total{status="failed"}[1h]))
+      - record: job:wallet_submission_error_rate:1h
+        expr: job:wallet_submissions_errors:rate1h / job:wallet_submissions_total:rate1h
+
+      - record: job:wallet_submissions_total:rate6h
+        expr: sum(rate(wallet_submissions_total[6h]))
+      - record: job:wallet_submissions_errors:rate6h
+        expr: sum(rate(wallet_submissions_total{status="failed"}[6h]))
+      - record: job:wallet_submission_error_rate:6h
+        expr: job:wallet_submissions_errors:rate6h / job:wallet_submissions_total:rate6h
+
+      # Latency SLI (p95 and p99 submission latency)
+      - record: job:wallet_submission_duration:p95
+        expr: histogram_quantile(0.95, sum(rate(wallet_submission_duration_ms_bucket[5m])) by (le))
+      - record: job:wallet_submission_duration:p99
+        expr: histogram_quantile(0.99, sum(rate(wallet_submission_duration_ms_bucket[5m])) by (le))
+
+  - name: globewallet_burn_rate_alerts
+    rules:
+      # SLO Target: 99.5% Submissions succeed (Error budget = 0.005)
+      # 1h Critical Page: 14.4x burn rate over 1h and 5m (consumes 2% error budget in 1 hour)
+      - alert: WalletSubmissionCriticalBurnRate1h
+        expr: |
+          (job:wallet_submission_error_rate:1h > (14.4 * 0.005))
+          and
+          (sum(rate(wallet_submissions_total{status="failed"}[5m])) / sum(rate(wallet_submissions_total[5m])) > (14.4 * 0.005))
+        for: 2m
+        labels:
+          severity: page
+          tier: critical
+        annotations:
+          summary: "Critical burn rate: 14.4x budget consumption for wallet submissions"
+          description: "Wallet submission failure rate is {{ $value | humanizePercentage }}, consuming 2% of 30d error budget in 1 hour."
+
+      # 6h Warning Ticket: 6x burn rate over 6h and 30m (consumes 5% error budget in 6 hours)
+      - alert: WalletSubmissionWarningBurnRate6h
+        expr: |
+          (job:wallet_submission_error_rate:6h > (6.0 * 0.005))
+          and
+          (sum(rate(wallet_submissions_total{status="failed"}[30m])) / sum(rate(wallet_submissions_total[30m])) > (6.0 * 0.005))
+        for: 15m
+        labels:
+          severity: ticket
+          tier: warning
+        annotations:
+          summary: "Elevated burn rate: 6x budget consumption for wallet submissions"
+          description: "Wallet submission failure rate is {{ $value | humanizePercentage }}, consuming 5% of 30d error budget in 6 hours."
+
+      # Submission Latency Alert: p95 latency exceeds 3000ms for 10 minutes
+      - alert: WalletSubmissionHighLatency
+        expr: job:wallet_submission_duration:p95 > 3000
+        for: 10m
+        labels:
+          severity: ticket
+          tier: warning
+        annotations:
+          summary: "Wallet submission p95 latency exceeds SLO threshold (3000ms)"
+          description: "95th percentile submission duration is {{ $value }}ms (SLO target: <3000ms)."
+
+      # Indexer Lag Alert: Indexer falls more than 20 ledgers behind chain tip
+      - alert: ActivityFeedIndexerLagHigh
+        expr: activity_feed_indexer_lag_ledgers > 20
+        for: 5m
+        labels:
+          severity: ticket
+          tier: warning
+        annotations:
+          summary: "Activity feed indexer is lagging behind Stellar ledger tip"
+          description: "Activity feed indexer is {{ $value }} ledgers behind current ledger tip (threshold: 20 ledgers)."

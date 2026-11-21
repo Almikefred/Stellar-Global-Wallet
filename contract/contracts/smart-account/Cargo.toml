@@ -1,0 +1,20 @@
+[package]
+name = "smart-account"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+# Test-only: produces real ed25519 signatures for `__check_auth` tests. The
+# contract itself verifies with the host function `env.crypto().ed25519_verify`
+# and never links this crate into the WASM (see docs/design/vendored-ed25519.md).
+ed25519-dalek = "2.2.0"
+
+[features]
+testutils = ["soroban-sdk/testutils"]

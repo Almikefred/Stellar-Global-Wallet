@@ -2,29 +2,93 @@ import jwt from "jsonwebtoken";
 import { randomUUID } from "crypto";
 import { createClient, RedisClientType } from "redis";
 import { config } from "../config";
+import { getCurrentKey, findKeyByKid } from "./jwtKeys";
+
+export type AuthMethod = "api-key" | "sep10";
 
 interface TokenPayload {
   sub: string;
   type: "access" | "refresh";
+  auth_method?: AuthMethod;
 }
 
 interface RefreshRecord {
   sub: string;
   revoked: boolean;
+  sessionId: string;
+  /** Carried across rotations so refreshed access tokens keep auth_method. */
+  authMethod?: AuthMethod;
+}
+
+/**
+ * Metadata captured when a refresh token (and therefore a session) is
+ * created. `ipHash` is a hash of the client IP, never the raw address, so
+ * the session listing can show "where" without storing PII (issue #37).
+ */
+export interface SessionMetadata {
+  userAgent?: string;
+  ipHash?: string;
+  /** How the session was established; set when the session is created. */
+  authMethod?: AuthMethod;
+}
+
+/**
+ * A first-class session record as exposed to clients via
+ * `GET /auth/sessions`. `id` is the session id (not the refresh token),
+ * so it is safe to return to the client and to use in
+ * `DELETE /auth/sessions/:id`.
+ */
+export interface SessionInfo {
+  id: string;
+  userAgent: string | null;
+  ipHash: string | null;
+  createdAt: string;
+  lastUsedAt: string;
 }
 
 const ACCESS_EXPIRY = "15m";
 const REFRESH_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000;
-const REFRESH_KEY_PREFIX = "orbit-wal:refresh-token:";
+const REFRESH_KEY_PREFIX = `orbit-wal:${config.STELLAR_NETWORK}:refresh-token:`;
+const SESSION_KEY_PREFIX = `orbit-wal:${config.STELLAR_NETWORK}:session:`;
+const ACCOUNT_SESSIONS_KEY_PREFIX = `orbit-wal:${config.STELLAR_NETWORK}:account-sessions:`;
 
-export function generateAccessToken(sub: string): string {
-  return jwt.sign({ sub, type: "access" } satisfies TokenPayload, config.JWT_SECRET, {
+export function generateAccessToken(sub: string, authMethod?: AuthMethod, sessionId?: string): string {
+  const payload: TokenPayload & { session_id?: string } = { sub, type: "access" };
+  if (authMethod) payload.auth_method = authMethod;
+  if (sessionId) payload.session_id = sessionId;
+  // Sign with the current RSA private key; embed the kid so verifiers can
+  // fetch the right public key from the JWKS endpoint (#199).
+  const signingKey = getCurrentKey();
+  return jwt.sign(payload, signingKey.privateKey.export({ type: "pkcs8", format: "pem" }) as string, {
+    algorithm: "RS256",
     expiresIn: ACCESS_EXPIRY,
+    keyid: signingKey.kid,
   });
 }
 
 export function verifyAccessToken(token: string): TokenPayload {
-  return jwt.verify(token, config.JWT_SECRET) as TokenPayload;
+  // Decode the header to find the kid, then pick the right public key (#199).
+  const decoded = jwt.decode(token, { complete: true });
+  const kid = typeof decoded?.header?.kid === "string" ? decoded.header.kid : undefined;
+
+  if (kid) {
+    const key = findKeyByKid(kid);
+    if (key) {
+      return jwt.verify(
+        token,
+        key.publicKey.export({ type: "spki", format: "pem" }) as string,
+        { algorithms: ["RS256"] }
+      ) as TokenPayload;
+    }
+  }
+
+  // Fallback: try the current key (handles tokens where kid header is missing).
+  const currentKey = getCurrentKey();
+  return jwt.verify(
+    token,
+    currentKey.publicKey.export({ type: "spki", format: "pem" }) as string,
+    { algorithms: ["RS256"] }
+  ) as TokenPayload;
 }
 
 /**
@@ -41,6 +105,12 @@ export function verifyAccessToken(token: string): TokenPayload {
  * Revocation is a `DEL`, but a `revoked` flag is still stored (write-then-
  * check) to keep provenance identical to the read-then-write shape the
  * old code had and to guard a narrow race between GET and DEL.
+ *
+ * Sessions (issue #37): every refresh token is now linked to a session
+ * row keyed by `sessionId`. The session record holds device metadata and
+ * is indexed per-account so `GET /auth/sessions` and revoke-all can find
+ * every active session for a user. Revoking a session deletes its refresh
+ * token, so a revoked session can never rotate again.
  */
 export class RedisRefreshTokenStore {
   private connectPromise?: Promise<void>;
@@ -51,6 +121,14 @@ export class RedisRefreshTokenStore {
     return `${REFRESH_KEY_PREFIX}${token}`;
   }
 
+  private sessionKey(sessionId: string): string {
+    return `${SESSION_KEY_PREFIX}${sessionId}`;
+  }
+
+  private accountSessionsKey(sub: string): string {
+    return `${ACCOUNT_SESSIONS_KEY_PREFIX}${sub}`;
+  }
+
   private async ensureConnected(): Promise<void> {
     if (this.client.isOpen) return;
     if (!this.connectPromise) {
@@ -59,31 +137,91 @@ export class RedisRefreshTokenStore {
     await this.connectPromise;
   }
 
-  async generate(sub: string): Promise<string> {
-    await this.ensureConnected();
+  private async createSession(
+    sub: string,
+    metadata: SessionMetadata
+  ): Promise<{ sessionId: string; token: string }> {
+    const sessionId = randomUUID();
     const token = randomUUID();
-    const record: RefreshRecord = { sub, revoked: false };
+    const now = new Date().toISOString();
+    const record: RefreshRecord = { sub, revoked: false, sessionId, authMethod: metadata.authMethod };
+    const session: SessionInfo = {
+      id: sessionId,
+      userAgent: metadata.userAgent ?? null,
+      ipHash: metadata.ipHash ?? null,
+      createdAt: now,
+      lastUsedAt: now,
+    };
+
     await this.client.set(this.key(token), JSON.stringify(record), {
       PX: REFRESH_EXPIRY_MS,
     });
+    await this.client.set(this.sessionKey(sessionId), JSON.stringify(session), {
+      PX: REFRESH_EXPIRY_MS,
+    });
+    await this.client.sAdd(this.accountSessionsKey(sub), sessionId);
+    await this.client.pExpire(this.accountSessionsKey(sub), REFRESH_EXPIRY_MS);
+
+    return { sessionId, token };
+  }
+
+  async generate(sub: string, metadata: SessionMetadata = {}): Promise<string> {
+    await this.ensureConnected();
+    const { token } = await this.createSession(sub, metadata);
     return token;
   }
 
-  async rotate(oldToken: string): Promise<{ sub: string; token: string } | null> {
+  async rotate(
+    oldToken: string,
+    metadata: SessionMetadata = {}
+  ): Promise<{ sub: string; token: string; sessionId: string; authMethod?: AuthMethod } | null> {
     await this.ensureConnected();
-    const raw = await this.client.get(this.key(oldToken));
+    // GETDEL consumes the token atomically: two concurrent refreshes with
+    // the same token can no longer both read it before either deletes it,
+    // which would mint two live sessions from one (possibly stolen) token.
+    const raw = await this.client.getDel(this.key(oldToken));
     if (!raw) return null;
     const record = JSON.parse(raw) as RefreshRecord;
     if (record.revoked) return null;
 
-    await this.client.del(this.key(oldToken));
-    const token = await this.generate(record.sub);
-    return { sub: record.sub, token };
+    // A session that has been revoked (e.g. via revoke-all) must not be
+    // able to rotate even if a stale refresh token still exists.
+    const sessionRaw = await this.client.get(this.sessionKey(record.sessionId));
+    if (!sessionRaw) return null;
+
+    const token = randomUUID();
+    const now = new Date().toISOString();
+    const nextRecord: RefreshRecord = {
+      sub: record.sub,
+      revoked: false,
+      sessionId: record.sessionId,
+      authMethod: record.authMethod,
+    };
+    await this.client.set(this.key(token), JSON.stringify(nextRecord), {
+      PX: REFRESH_EXPIRY_MS,
+    });
+
+    const session = JSON.parse(sessionRaw) as SessionInfo;
+    const updated: SessionInfo = {
+      ...session,
+      lastUsedAt: now,
+      userAgent: metadata.userAgent ?? session.userAgent,
+      ipHash: metadata.ipHash ?? session.ipHash,
+    };
+    await this.client.set(this.sessionKey(record.sessionId), JSON.stringify(updated), {
+      PX: REFRESH_EXPIRY_MS,
+    });
+
+    return { sub: record.sub, token, sessionId: record.sessionId, authMethod: record.authMethod };
   }
 
   async revoke(token: string): Promise<void> {
     await this.ensureConnected();
+    const raw = await this.client.get(this.key(token));
     await this.client.del(this.key(token));
+    if (!raw) return;
+    const record = JSON.parse(raw) as RefreshRecord;
+    await this.revokeSession(record.sub, record.sessionId);
   }
 
   async getSub(token: string): Promise<string | null> {
@@ -92,6 +230,67 @@ export class RedisRefreshTokenStore {
     if (!raw) return null;
     const record = JSON.parse(raw) as RefreshRecord;
     return record.revoked ? null : record.sub;
+  }
+
+  async getSessionId(token: string): Promise<string | null> {
+    await this.ensureConnected();
+    const raw = await this.client.get(this.key(token));
+    if (!raw) return null;
+    const record = JSON.parse(raw) as RefreshRecord;
+    return record.revoked ? null : record.sessionId;
+  }
+
+  async listSessions(sub: string): Promise<SessionInfo[]> {
+    await this.ensureConnected();
+    const ids = await this.client.sMembers(this.accountSessionsKey(sub));
+    if (ids.length === 0) return [];
+
+    const sessions: SessionInfo[] = [];
+    for (const id of ids) {
+      const raw = await this.client.get(this.sessionKey(id));
+      if (!raw) {
+        // Session expired or was revoked; prune the stale index entry.
+        await this.client.sRem(this.accountSessionsKey(sub), id);
+        continue;
+      }
+      sessions.push(JSON.parse(raw) as SessionInfo);
+    }
+    return sessions.sort((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt));
+  }
+
+  /**
+   * Revoke a single session, but only if it belongs to `sub`. Returns
+   * `true` when a session was revoked, `false` when it did not exist or
+   * belonged to another account (deny-by-default, issue #37).
+   */
+  async revokeSession(sub: string, sessionId: string): Promise<boolean> {
+    await this.ensureConnected();
+    const isMember = await this.client.sIsMember(
+      this.accountSessionsKey(sub),
+      sessionId
+    );
+    if (!isMember) return false;
+
+    await this.client.del(this.sessionKey(sessionId));
+    await this.client.sRem(this.accountSessionsKey(sub), sessionId);
+    return true;
+  }
+
+  /**
+   * Revoke every session for `sub` except `keepSessionId` (the caller's
+   * current session). Returns the number of sessions revoked.
+   */
+  async revokeAllSessions(sub: string, keepSessionId?: string): Promise<number> {
+    await this.ensureConnected();
+    const ids = await this.client.sMembers(this.accountSessionsKey(sub));
+    let revoked = 0;
+    for (const id of ids) {
+      if (keepSessionId && id === keepSessionId) continue;
+      await this.client.del(this.sessionKey(id));
+      await this.client.sRem(this.accountSessionsKey(sub), id);
+      revoked += 1;
+    }
+    return revoked;
   }
 }
 
@@ -114,18 +313,23 @@ function getDefaultStore(): RedisRefreshTokenStore {
   return defaultStore;
 }
 
-export async function generateRefreshToken(sub: string): Promise<string> {
-  return getDefaultStore().generate(sub);
+export async function generateRefreshToken(
+  sub: string,
+  metadata: SessionMetadata = {}
+): Promise<string> {
+  return getDefaultStore().generate(sub, metadata);
 }
 
 export async function rotateRefreshToken(
-  oldToken: string
-): Promise<{ accessToken: string; refreshToken: string } | null> {
-  const result = await getDefaultStore().rotate(oldToken);
+  oldToken: string,
+  metadata: SessionMetadata = {}
+): Promise<{ accessToken: string; refreshToken: string; sessionId: string } | null> {
+  const result = await getDefaultStore().rotate(oldToken, metadata);
   if (!result) return null;
   return {
-    accessToken: generateAccessToken(result.sub),
+    accessToken: generateAccessToken(result.sub, result.authMethod, result.sessionId),
     refreshToken: result.token,
+    sessionId: result.sessionId,
   };
 }
 
@@ -135,4 +339,23 @@ export async function revokeRefreshToken(token: string): Promise<void> {
 
 export async function getRefreshTokenSub(token: string): Promise<string | null> {
   return getDefaultStore().getSub(token);
+}
+
+export async function getRefreshTokenSessionId(token: string): Promise<string | null> {
+  return getDefaultStore().getSessionId(token);
+}
+
+export async function listSessions(sub: string): Promise<SessionInfo[]> {
+  return getDefaultStore().listSessions(sub);
+}
+
+export async function revokeSession(sub: string, sessionId: string): Promise<boolean> {
+  return getDefaultStore().revokeSession(sub, sessionId);
+}
+
+export async function revokeAllSessions(
+  sub: string,
+  keepSessionId?: string
+): Promise<number> {
+  return getDefaultStore().revokeAllSessions(sub, keepSessionId);
 }

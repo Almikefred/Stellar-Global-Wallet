@@ -14,7 +14,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONTRACT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 REPO_ROOT="$(cd "${CONTRACT_DIR}/.." && pwd)"
 
-WASM_PATH="${CONTRACT_DIR}/target/wasm32-unknown-unknown/release/globe_wallet.wasm"
+# Stellar CLI >= 25 builds for wasm32v1-none; older releases used
+# wasm32-unknown-unknown. Accept whichever the installed CLI produced.
+WASM_CANDIDATES=(
+  "${CONTRACT_DIR}/target/wasm32v1-none/release/globe_wallet.wasm"
+  "${CONTRACT_DIR}/target/wasm32-unknown-unknown/release/globe_wallet.wasm"
+)
 OUTPUT_DIR="${REPO_ROOT}/packages/bindings/globe-wallet"
 
 if ! command -v stellar >/dev/null 2>&1; then
@@ -28,16 +33,38 @@ echo "==> Building globe-wallet contract wasm"
   stellar contract build
 )
 
-if [[ ! -f "${WASM_PATH}" ]]; then
-  echo "error: expected wasm at ${WASM_PATH} but it was not produced by 'stellar contract build'" >&2
+WASM_PATH=""
+for candidate in "${WASM_CANDIDATES[@]}"; do
+  if [[ -f "${candidate}" ]]; then
+    WASM_PATH="${candidate}"
+    break
+  fi
+done
+
+if [[ -z "${WASM_PATH}" ]]; then
+  echo "error: globe_wallet.wasm was not produced by 'stellar contract build' (looked in: ${WASM_CANDIDATES[*]})" >&2
   exit 1
 fi
 
 echo "==> Generating TypeScript bindings into ${OUTPUT_DIR}"
 mkdir -p "${OUTPUT_DIR}"
+
+# The generator writes its own package.json (named after the contract, with
+# no workspace scripts). Ours is hand-maintained -- the package name is what
+# the SDK imports -- so keep it across regeneration.
+MANIFEST_BACKUP=""
+if [[ -f "${OUTPUT_DIR}/package.json" ]]; then
+  MANIFEST_BACKUP="$(mktemp)"
+  cp "${OUTPUT_DIR}/package.json" "${MANIFEST_BACKUP}"
+fi
+
 stellar contract bindings typescript \
   --wasm "${WASM_PATH}" \
   --output-dir "${OUTPUT_DIR}" \
   --overwrite
+
+if [[ -n "${MANIFEST_BACKUP}" ]]; then
+  mv "${MANIFEST_BACKUP}" "${OUTPUT_DIR}/package.json"
+fi
 
 echo "==> Done. Bindings written to ${OUTPUT_DIR}"

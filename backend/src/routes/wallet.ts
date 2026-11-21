@@ -1,14 +1,37 @@
 import { Router, Request, Response, NextFunction } from "express";
 import { body, param } from "express-validator";
+import { config } from "../config";
 import { jwtAuth } from "../middleware/jwtAuth";
+import { requireAccountMatch } from "../middleware/requireAccountMatch";
+import { isValidMuxedId } from "../utils/muxed";
+import {
+  isValidWeight,
+  MAX_WEIGHT,
+  SetOptionsInput,
+  SetOptionsResult,
+  simulateSetOptions,
+} from "../services/setOptions";
+import { deprecated } from "../middleware/deprecated";
 import { assertValidRequest } from "../middleware/requestValidation";
 import { logKeypairIssuance } from "../services/auditLog";
 import { StellarService } from "../services/stellar";
 import { isGAddress, publicKeyMessage, destinationMessage } from "../utils/stellarAddress";
-import { validatePathAssets } from "../validation/stellarAsset";
-import { isValidMemoText, memoTextMessage } from "@globe-wallet/sdk";
+import { isValidIssuedAsset, validatePathAssets } from "../validation/stellarAsset";
+import {
+  amountMessage,
+  isValidMemoText,
+  isValidStellarAmount,
+  memoTextMessage,
+} from "@globe-wallet/sdk";
 import * as StellarSdk from "@stellar/stellar-sdk";
-import { getCachedResult, cacheResult } from "../services/idempotency";
+import {
+  claimIdempotencyKey,
+  commitIdempotencyResult,
+  releaseIdempotencyKey,
+  requestFingerprint,
+} from "../services/idempotency";
+import { shutdownManager } from "../services/shutdown";
+import { createClientSigningRouter } from "./clientSigning";
 
 const SEP7_PAY_PREFIX = "web+stellar:pay?";
 
@@ -90,23 +113,65 @@ async function handleIdempotentRequest(
 ) {
   try {
     assertValidRequest(req);
-    const idempotencyKey = req.body.idempotencyKey;
+    const idempotencyKey: string | undefined = req.body.idempotencyKey;
     let sourcePublicKey: string | undefined;
+    let fingerprint: string | undefined;
 
     if (idempotencyKey && secretKey) {
       const keypair = StellarSdk.Keypair.fromSecret(secretKey);
       sourcePublicKey = keypair.publicKey();
-      const cached = await getCachedResult(sourcePublicKey, idempotencyKey);
-      if (cached) {
-        res.json({ hash: cached.hash, successful: cached.successful });
+      // Bind the key to the request body so the same key cannot be reused
+      // for a different payload (#198 — request fingerprint).
+      fingerprint = requestFingerprint(req.body);
+
+      const claim = await claimIdempotencyKey(sourcePublicKey, idempotencyKey, fingerprint);
+
+      if (claim.status === "hit") {
+        res.json({ hash: claim.result.hash, successful: claim.result.successful });
         return;
       }
+      if (claim.status === "conflict") {
+        res.status(422).json({
+          error: {
+            code: "IDEMPOTENCY_KEY_REUSED",
+            message:
+              "This idempotency key was already used for a different request body. Use a new key.",
+          },
+        });
+        return;
+      }
+      if (claim.status === "in-flight") {
+        res.status(409).json({
+          error: {
+            code: "IDEMPOTENCY_KEY_IN_FLIGHT",
+            message: "This request is still being processed. Retry in a moment.",
+            retryable: true,
+          },
+        });
+        return;
+      }
+      // claim.status === "claimed" — fall through to execute.
     }
 
-    const result = await execute();
+    let result: { hash: string; successful: boolean };
+    try {
+      result = await execute();
+    } catch (execErr) {
+      // Release the sentinel so the client can retry with the same key.
+      if (sourcePublicKey && idempotencyKey) {
+        await releaseIdempotencyKey(sourcePublicKey, idempotencyKey);
+      }
+      throw execErr;
+    }
 
-    if (idempotencyKey && sourcePublicKey) {
-      await cacheResult(sourcePublicKey, idempotencyKey, result.hash, result.successful);
+    if (sourcePublicKey && idempotencyKey && fingerprint) {
+      await commitIdempotencyResult(
+        sourcePublicKey,
+        idempotencyKey,
+        fingerprint,
+        result.hash,
+        result.successful
+      );
     }
 
     res.json({ hash: result.hash, successful: result.successful });
@@ -118,7 +183,70 @@ async function handleIdempotentRequest(
 export function createWalletRouter(stellar: StellarService): Router {
   const walletRouter = Router();
 
+  const deprecatedRoutes: Record<string, string> = {
+    "/send": "POST /api/v1/wallet/send",
+    "/fee-bump": "POST /api/v1/wallet/fee-bump",
+    "/path-payment-strict-send": "POST /api/v1/wallet/path-payment-strict-send",
+    "/path-payment-strict-receive": "POST /api/v1/wallet/path-payment-strict-receive",
+    "/partial-transaction": "POST /api/v1/wallet/partial-transaction",
+    "/keypair": "POST /api/v1/wallet/keypair",
+  };
+  walletRouter.use((req, res, next) => {
+    if (req.method !== "POST") return next();
+    const route = deprecatedRoutes[req.path];
+    if (route) return deprecated(route)(req, res, next);
+    return next();
+  });
+
   walletRouter.use(jwtAuth);
+  // #33 — a token for account A cannot act for account B.
+  walletRouter.use(requireAccountMatch());
+
+  // #9 — build unsigned XDR for adding or removing a classic Stellar trustline.
+  walletRouter.post(
+    "/trustline/build",
+    body().custom((value: unknown) => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+      return Object.keys(value).every((key) => ["account", "asset", "limit"].includes(key));
+    }),
+    body("account")
+      .isLength({ min: 56, max: 56 })
+      .bail()
+      .custom(isGAddress)
+      .withMessage(publicKeyMessage),
+    body("asset")
+      .isObject()
+      .custom((asset: unknown) => {
+        if (!asset || typeof asset !== "object" || Array.isArray(asset)) return false;
+        const value = asset as Record<string, unknown>;
+        return (
+          Object.keys(value).every((key) => key === "code" || key === "issuer") &&
+          typeof value.code === "string" &&
+          /^[A-Za-z0-9]{1,12}$/.test(value.code) &&
+          typeof value.issuer === "string" &&
+          isGAddress(value.issuer)
+        );
+      })
+      .withMessage("asset must include a valid 1-12 character code and issuer account"),
+    body("limit")
+      .optional()
+      .isString()
+      .matches(/^(?:0|[1-9]\d*)(?:\.\d{1,7})?$/)
+      .withMessage('limit must be a decimal string or "0" to remove the trustline'),
+    async (req, res, next) => {
+      try {
+        assertValidRequest(req);
+        const result = await stellar.buildTrustlineTransaction({
+          account: req.body.account,
+          asset: req.body.asset,
+          limit: req.body.limit,
+        });
+        res.json(result);
+      } catch (err) {
+        next(err);
+      }
+    }
+  );
 
   walletRouter.post(
     "/payment-requests",
@@ -201,6 +329,46 @@ export function createWalletRouter(stellar: StellarService): Router {
       handleIdempotentRequest(req, res, next, req.body.sourceSecretKey, () => stellar.sendPayment(req.body))
   );
 
+  // #64 — read-only pre-signing checks. Takes the source *public* key (the
+  // client hasn't signed anything yet) and returns every reason the send
+  // would fail or lose funds, so the UI can warn before the user signs.
+  // Always 200 for a well-formed request; problems come back as warnings.
+  walletRouter.post(
+    "/send/precheck",
+    body("sourcePublicKey")
+      .isLength({ min: 56, max: 56 })
+      .bail()
+      .custom(isGAddress)
+      .withMessage(publicKeyMessage),
+    body("destinationPublicKey")
+      .isLength({ min: 56, max: 56 })
+      .bail()
+      .custom(isGAddress)
+      .withMessage(destinationMessage),
+    body("amount").custom(isValidStellarAmount).withMessage(amountMessage),
+    body("asset")
+      .optional()
+      .custom((asset: unknown) => asset === "XLM" || isValidIssuedAsset(asset))
+      .withMessage('asset must be "XLM" or CODE:ISSUER'),
+    body("memo").optional().isString().custom(isValidMemoText).withMessage(memoTextMessage),
+    async (req, res, next) => {
+      try {
+        assertValidRequest(req);
+        const { sourcePublicKey, destinationPublicKey, amount, asset, memo } = req.body;
+        const result = await stellar.precheckSend({
+          sourcePublicKey,
+          destinationPublicKey,
+          amount,
+          asset,
+          memo,
+        });
+        res.json(result);
+      } catch (err) {
+        next(err);
+      }
+    }
+  );
+
   walletRouter.post(
     "/fee-bump",
     body("transactionXdr").isString().notEmpty(),
@@ -211,6 +379,35 @@ export function createWalletRouter(stellar: StellarService): Router {
       handleIdempotentRequest(req, res, next, req.body.feeSecretKey, () => stellar.feeBumpTransaction(req.body))
   );
 
+  // #195 — sponsored fee-bump: the server pays fees on behalf of a user whose
+  // account has insufficient XLM. The inner transaction must already be signed
+  // by the account's key; the backend wraps it in a fee-bump envelope using
+  // the FEE_SPONSOR_SECRET_KEY configured in the environment.
+  walletRouter.post(
+    "/sponsor-fee",
+    body("transactionXdr").isString().notEmpty(),
+    body("innerAccount")
+      .isLength({ min: 56, max: 56 })
+      .bail()
+      .custom(isGAddress)
+      .withMessage(publicKeyMessage),
+    async (req, res, next) => {
+      try {
+        assertValidRequest(req);
+        const { sponsorFeeBump } = await import("../services/feeSponsorship");
+        const result = await sponsorFeeBump(
+          req.body.innerAccount,
+          req.body.transactionXdr,
+          config.HORIZON_URL,
+          config.NETWORK_PASSPHRASE
+        );
+        res.json(result);
+      } catch (err) {
+        next(err);
+      }
+    }
+  );
+
   walletRouter.post(
     "/path-payment-strict-send",
     body("sourceSecretKey").isLength({ min: 56, max: 56 }),
@@ -219,25 +416,27 @@ export function createWalletRouter(stellar: StellarService): Router {
       .bail()
       .custom(isGAddress)
       .withMessage(destinationMessage),
-    body("sendAmount").isDecimal({ decimal_digits: "0,7" }),
-    body("destAsset").isString(),
-    body("destMin").isDecimal({ decimal_digits: "0,7" }),
-    body("path").optional().custom((path: unknown) => {
-      if (!Array.isArray(path)) {
-        throw new Error("Path must be an array");
-      }
-      validatePathAssets(path);
-      return true;
-    }),
-    // Stellar's MEMO_TEXT limit is 28 *bytes* once UTF-8 encoded, not 28
-    // characters — `isLength({ max: 28 })` (the previous check here) counts
-    // characters, so it wrongly accepted e.g. a 20-character memo full of
-    // emoji/CJK text that's well over 28 bytes and would be rejected
-    // on-chain. See packages/sdk/src/validate/memo.ts (#103).
+    body("sendAmount").custom(isValidStellarAmount).withMessage(amountMessage),
+    body("destAsset")
+      .custom((asset: unknown) => asset === "XLM" || isValidIssuedAsset(asset))
+      .withMessage('destAsset must be "XLM" or CODE:ISSUER'),
+    body("destMin").custom(isValidStellarAmount).withMessage(amountMessage),
+    body("path")
+      .optional()
+      .custom((path: unknown) => {
+        validatePathAssets(path);
+        return true;
+      }),
     body("memo").optional().isString().custom(isValidMemoText).withMessage(memoTextMessage),
-    body("idempotencyKey").optional().isString().isLength({ max: 255 }),
-    (req, res, next) =>
-      handleIdempotentRequest(req, res, next, req.body.sourceSecretKey, () => stellar.pathPaymentStrictSend(req.body))
+    async (req, res, next) => {
+      try {
+        assertValidRequest(req);
+        const result = await stellar.pathPaymentStrictSend(req.body);
+        res.json({ hash: result.hash, successful: result.successful });
+      } catch (err) {
+        next(err);
+      }
+    }
   );
 
   walletRouter.post(
@@ -248,25 +447,220 @@ export function createWalletRouter(stellar: StellarService): Router {
       .bail()
       .custom(isGAddress)
       .withMessage(destinationMessage),
-    body("destAmount").isDecimal({ decimal_digits: "0,7" }),
-    body("destAsset").isString(),
-    body("sendMax").isDecimal({ decimal_digits: "0,7" }),
-    body("path").optional().custom((path: unknown) => {
-      if (!Array.isArray(path)) {
-        throw new Error("Path must be an array");
+    body("destAmount").custom(isValidStellarAmount).withMessage(amountMessage),
+    body("destAsset")
+      .custom((asset: unknown) => asset === "XLM" || isValidIssuedAsset(asset))
+      .withMessage('destAsset must be "XLM" or CODE:ISSUER'),
+    body("sendMax").custom(isValidStellarAmount).withMessage(amountMessage),
+    body("path")
+      .optional()
+      .custom((path: unknown) => {
+        validatePathAssets(path);
+        return true;
+      }),
+    body("memo").optional().isString().custom(isValidMemoText).withMessage(memoTextMessage),
+    async (req, res, next) => {
+      try {
+        assertValidRequest(req);
+        const result = await stellar.pathPaymentStrictReceive(req.body);
+        res.json({ hash: result.hash, successful: result.successful });
+      } catch (err) {
+        next(err);
       }
-      validatePathAssets(path);
-      return true;
-    }),
+    }
+  );
+
+  // Generate a muxed (M-address) receive address for a base account. Exchanges
+  // and custodial services use muxed accounts to tag deposits to a sub-account.
+  walletRouter.post(
+    "/:publicKey/muxed",
+    param("publicKey")
+      .isLength({ min: 56, max: 56 })
+      .bail()
+      .custom(isGAddress)
+      .withMessage(publicKeyMessage),
+    body("id")
+      .exists({ checkNull: true })
+      .bail()
+      .custom(isValidMuxedId)
+      .withMessage("id must be a non-negative integer within the uint64 range"),
+    (req, res, next) => {
+      try {
+        assertValidRequest(req);
+        const publicKey = req.params.publicKey;
+        const id = BigInt(req.body.id);
+        // MuxedAccount only needs the base account ID; the sequence number
+        // is irrelevant for deriving the M... address.
+        const muxed = new StellarSdk.MuxedAccount(new StellarSdk.Account(publicKey, "0"), id.toString());
+        res.json({
+          publicKey,
+          baseAccount: muxed.baseAccount().accountId(),
+          id: id.toString(),
+          muxedAccount: muxed.accountId(),
+        });
+      } catch (err) {
+        next(err);
+      }
+    }
+  );
+
+  // Build an unsigned `setOptions` transaction for multisig management
+  // (add/remove signers, master weight, thresholds). Returns the XDR for
+  // client-side signing; never accepts a secret key. Rejects changes that
+  // would lock the account out.
+  walletRouter.post(
+    "/set-options/build",
+    body("sourcePublicKey")
+      .isLength({ min: 56, max: 56 })
+      .bail()
+      .custom(isGAddress)
+      .withMessage(publicKeyMessage),
+    body("addSigners")
+      .optional()
+      .isArray({ max: 20 })
+      .withMessage("addSigners must be an array of at most 20 signers"),
+    body("addSigners.*.key")
+      .if(body("addSigners").exists())
+      .isLength({ min: 56, max: 56 })
+      .bail()
+      .custom(isGAddress)
+      .withMessage(publicKeyMessage),
+    body("addSigners.*.weight")
+      .if(body("addSigners").exists())
+      .custom(isValidWeight)
+      .withMessage(`weight must be an integer between 0 and ${MAX_WEIGHT}`),
+    body("removeSigners")
+      .optional()
+      .isArray({ max: 20 })
+      .withMessage("removeSigners must be an array of at most 20 signer keys"),
+    body("removeSigners.*")
+      .if(body("removeSigners").exists())
+      .isLength({ min: 56, max: 56 })
+      .bail()
+      .custom(isGAddress)
+      .withMessage(publicKeyMessage),
+    body("masterWeight")
+      .optional()
+      .custom(isValidWeight)
+      .withMessage(`masterWeight must be an integer between 0 and ${MAX_WEIGHT}`),
+    body("lowThreshold")
+      .optional()
+      .custom(isValidWeight)
+      .withMessage(`lowThreshold must be an integer between 0 and ${MAX_WEIGHT}`),
+    body("mediumThreshold")
+      .optional()
+      .custom(isValidWeight)
+      .withMessage(`mediumThreshold must be an integer between 0 and ${MAX_WEIGHT}`),
+    body("highThreshold")
+      .optional()
+      .custom(isValidWeight)
+      .withMessage(`highThreshold must be an integer between 0 and ${MAX_WEIGHT}`),
+    async (req, res, next) => {
+      try {
+        assertValidRequest(req);
+        const input: SetOptionsInput = {
+          sourcePublicKey: req.body.sourcePublicKey,
+          addSigners: req.body.addSigners,
+          removeSigners: req.body.removeSigners,
+          masterWeight: req.body.masterWeight,
+          lowThreshold: req.body.lowThreshold,
+          mediumThreshold: req.body.mediumThreshold,
+          highThreshold: req.body.highThreshold,
+        };
+
+        const account = await stellar.getAccount(input.sourcePublicKey);
+        const simulation = simulateSetOptions(account, input);
+
+        const builder = new StellarSdk.TransactionBuilder(account, {
+          fee: StellarSdk.BASE_FEE,
+          networkPassphrase: config.NETWORK_PASSPHRASE,
+        });
+
+        const opts: Parameters<typeof StellarSdk.Operation.setOptions>[0] = {};
+        if (input.masterWeight !== undefined) {
+          opts.masterWeight = input.masterWeight;
+        }
+        if (input.lowThreshold !== undefined) {
+          opts.lowThreshold = input.lowThreshold;
+        }
+        if (input.mediumThreshold !== undefined) {
+          opts.medThreshold = input.mediumThreshold;
+        }
+        if (input.highThreshold !== undefined) {
+          opts.highThreshold = input.highThreshold;
+        }
+        if (input.addSigners && input.addSigners.length > 0) {
+          opts.signer = {
+            ed25519PublicKey: input.addSigners[0].key,
+            weight: input.addSigners[0].weight,
+          };
+        }
+
+        builder.addOperation(StellarSdk.Operation.setOptions(opts));
+
+        // Additional signers beyond the first are added as separate operations.
+        for (const signer of (input.addSigners ?? []).slice(1)) {
+          builder.addOperation(
+            StellarSdk.Operation.setOptions({
+              signer: { ed25519PublicKey: signer.key, weight: signer.weight },
+            })
+          );
+        }
+
+        // Removing a signer is expressed by setting its weight to 0.
+        for (const key of input.removeSigners ?? []) {
+          if (key === input.sourcePublicKey) {
+            continue;
+          }
+          builder.addOperation(
+            StellarSdk.Operation.setOptions({
+              signer: { ed25519PublicKey: key, weight: 0 },
+            })
+          );
+        }
+
+        builder.setTimeout(180);
+        const transaction = builder.build();
+
+        const result: SetOptionsResult = {
+          xdr: transaction.toXDR(),
+          networkPassphrase: config.NETWORK_PASSPHRASE,
+          warnings: simulation.warnings,
+          resultingSigners: simulation.signers,
+          resultingThresholds: simulation.thresholds,
+        };
+        res.json(result);
+      } catch (err) {
+        next(err);
+      }
+    }
+  );
+
+  walletRouter.post(
+    "/partial-transaction",
+    body("sourceSecretKey").isLength({ min: 56, max: 56 }),
+    body("destinationPublicKey")
+      .isLength({ min: 56, max: 56 })
+      .bail()
+      .custom(isGAddress)
+      .withMessage(destinationMessage),
+    body("amount").isDecimal({ decimal_digits: "0,7" }),
+    body("asset").optional().isString(),
     // Stellar's MEMO_TEXT limit is 28 *bytes* once UTF-8 encoded, not 28
     // characters — `isLength({ max: 28 })` (the previous check here) counts
     // characters, so it wrongly accepted e.g. a 20-character memo full of
     // emoji/CJK text that's well over 28 bytes and would be rejected
     // on-chain. See packages/sdk/src/validate/memo.ts (#103).
     body("memo").optional().isString().custom(isValidMemoText).withMessage(memoTextMessage),
-    body("idempotencyKey").optional().isString().isLength({ max: 255 }),
-    (req, res, next) =>
-      handleIdempotentRequest(req, res, next, req.body.sourceSecretKey, () => stellar.pathPaymentStrictReceive(req.body))
+    async (req, res, next) => {
+      try {
+        assertValidRequest(req);
+        const result = await stellar.buildPartialTransaction(req.body);
+        res.json(result);
+      } catch (err) {
+        next(err);
+      }
+    }
   );
 
   walletRouter.post(
@@ -314,31 +708,46 @@ export function createWalletRouter(stellar: StellarService): Router {
   );
 
   walletRouter.post(
-    "/partial-transaction",
-    body("sourceSecretKey").isLength({ min: 56, max: 56 }),
-    body("destinationPublicKey")
-      .isLength({ min: 56, max: 56 })
-      .bail()
-      .custom(isGAddress)
-      .withMessage(destinationMessage),
-    body("amount").isDecimal({ decimal_digits: "0,7" }),
-    body("asset").optional().isString(),
-    // Stellar's MEMO_TEXT limit is 28 *bytes* once UTF-8 encoded, not 28
-    // characters — `isLength({ max: 28 })` (the previous check here) counts
-    // characters, so it wrongly accepted e.g. a 20-character memo full of
-    // emoji/CJK text that's well over 28 bytes and would be rejected
-    // on-chain. See packages/sdk/src/validate/memo.ts (#103).
-    body("memo").optional().isString().custom(isValidMemoText).withMessage(memoTextMessage),
+    "/submit-multisig",
+    body("xdr").isString(),
+    body("signerSecretKeys").isArray({ min: 1 }),
+    body("signerSecretKeys.*").isLength({ min: 56, max: 56 }),
+    body("idempotencyKey").optional().isString().isLength({ max: 255 }),
+    (req, res, next) => {
+      const firstSigner = Array.isArray(req.body.signerSecretKeys) ? req.body.signerSecretKeys[0] : undefined;
+      handleIdempotentRequest(req, res, next, firstSigner, () =>
+        shutdownManager.trackSubmission(() => stellar.submitWithAdditionalSignatures(req.body))
+      );
+    }
+  );
+
+  walletRouter.get(
+    "/:publicKey/thresholds",
+    param("publicKey").custom(isGAddress).withMessage(publicKeyMessage),
     async (req, res, next) => {
       try {
         assertValidRequest(req);
-        const result = await stellar.buildPartialTransaction(req.body);
+        const result = await stellar.getAccountThresholds(req.params.publicKey);
         res.json(result);
       } catch (err) {
         next(err);
       }
     }
   );
+
+  // #88 — audit entries are tied to the authenticated caller (the JWT
+  // subject), not an x-api-key header that Bearer clients never send.
+  walletRouter.post("/keypair", async (req, res, next) => {
+    try {
+      const keypair = stellar.generateKeypair();
+      const publicKey = keypair.publicKey();
+      const secretKey = keypair.secret();
+      await logKeypairIssuance(req.user?.sub ?? "anonymous", publicKey);
+      res.json({ publicKey, secretKey });
+    } catch (err) {
+      next(err);
+    }
+  });
 
   return walletRouter;
 }

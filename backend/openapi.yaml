@@ -1,0 +1,1628 @@
+openapi: 3.1.0
+info:
+  title: Stellar Global Wallet API
+  version: 1.0.0
+  description: |
+    Machine-readable contract for every `/api/v1` route exposed by the
+    Stellar Global Wallet backend. Amounts are always strings to avoid
+    floating point precision loss (Stellar uses 7 decimal places, see
+    [SEP-0001](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0001.md)).
+servers:
+  - url: http://localhost:3000/api/v1
+    description: Local development
+  - url: https://api.stellar-wallet.example/api/v1
+    description: Production
+tags:
+  - name: auth
+    description: Authentication and session management
+  - name: wallet
+    description: Wallet creation and management
+  - name: account
+    description: Stellar account operations
+  - name: contract
+    description: Soroban smart contract interactions
+  - name: price
+    description: Asset price lookups
+  - name: config
+    description: Runtime configuration
+  - name: health
+    description: Service health checks
+paths:
+  /auth/register:
+    post:
+      tags: [auth]
+      summary: Register a new user
+      operationId: registerUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email:
+                  type: string
+                  format: email
+                password:
+                  type: string
+                  minLength: 8
+      responses:
+        '201':
+          description: User created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /auth/login:
+    post:
+      tags: [auth]
+      summary: Authenticate and receive a JWT
+      operationId: loginUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email:
+                  type: string
+                  format: email
+                password:
+                  type: string
+      responses:
+        '200':
+          description: Authenticated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /auth/me:
+    get:
+      tags: [auth]
+      summary: Get the current authenticated user
+      operationId: getCurrentUser
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Current user
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /wallet:
+    get:
+      tags: [wallet]
+      summary: List wallets for the current user
+      operationId: listWallets
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: Paginated wallets
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [wallet]
+      summary: Create a wallet
+      operationId: createWallet
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                  minLength: 1
+      responses:
+        '201':
+          description: Wallet created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Wallet'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /wallet/{walletId}:
+    parameters:
+      - $ref: '#/components/parameters/WalletId'
+    get:
+      tags: [wallet]
+      summary: Get a wallet by id
+      operationId: getWallet
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Wallet
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Wallet'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [wallet]
+      summary: Delete a wallet
+      operationId: deleteWallet
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: Deleted
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /account/{address}:
+    parameters:
+      - $ref: '#/components/parameters/StellarAddress'
+    get:
+      tags: [account]
+      summary: Get Stellar account details
+      operationId: getAccount
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Account details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Account'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /account/{address}/balance:
+    parameters:
+      - $ref: '#/components/parameters/StellarAddress'
+    get:
+      tags: [account]
+      summary: Get account balances
+      operationId: getAccountBalance
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Balances
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Balance'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /contract/upgrade/status:
+    get:
+      tags: [contract]
+      summary: Public contract-upgrade announcements (#186)
+      description: >
+        On-chain pending upgrade (timelock) plus what the backend upgrade
+        watcher has observed from `upgrade_proposed` / `upgrade_executed`
+        events. `watcher.watching` is false when the worker is not running.
+        No authentication required.
+      operationId: getUpgradeStatus
+      security: []
+      responses:
+        '200':
+          description: Upgrade status
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [pendingUpgrade, watcher]
+                properties:
+                  pendingUpgrade:
+                    nullable: true
+                    type: object
+                    properties:
+                      wasmHash: { type: string }
+                      proposedBy: { type: string }
+                      readyAtLedger: { type: integer }
+                      executableAt: { type: string, format: date-time, nullable: true }
+                  watcher:
+                    type: object
+                    required: [watching, history]
+                    properties:
+                      contractId: { type: string, nullable: true }
+                      watching: { type: boolean }
+                      lastCheckedLedger: { type: integer, nullable: true }
+                      pending:
+                        nullable: true
+                        allOf:
+                          - $ref: '#/components/schemas/UpgradeEvent'
+                      history:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/UpgradeEvent'
+  /contract/{contractId}:
+    parameters:
+      - $ref: '#/components/parameters/ContractId'
+    get:
+      tags: [contract]
+      summary: Get Soroban contract metadata
+      operationId: getContract
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Contract metadata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Contract'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /contract/{contractId}/invoke:
+    parameters:
+      - $ref: '#/components/parameters/ContractId'
+    post:
+      tags: [contract]
+      summary: Invoke a Soroban contract method
+      operationId: invokeContract
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [method]
+              properties:
+                method:
+                  type: string
+                args:
+                  type: array
+                  items: {}
+      responses:
+        '200':
+          description: Invocation result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  result: {}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /price/{asset}:
+    parameters:
+      - $ref: '#/components/parameters/Asset'
+    get:
+      tags: [price]
+      summary: Get the current price for an asset
+      operationId: getPrice
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Price
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Price'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /config:
+    get:
+      tags: [config]
+      summary: Get public runtime configuration
+      operationId: getConfig
+      responses:
+        '200':
+          description: Configuration
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClientConfig'
+          headers:
+            Cache-Control:
+              description: Configuration is cached for 60 seconds.
+              schema:
+                type: string
+                example: public, max-age=60
+  /wallet/trustline/build:
+    post:
+      tags: [wallet]
+      summary: Build an unsigned trustline change
+      operationId: buildTrustline
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TrustlineBuildRequest'
+      responses:
+        '200':
+          description: Unsigned changeTrust transaction and reserve impact
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrustlineBuildResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Trustline or issuer account not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '409':
+          description: Trustline has a non-zero balance
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '422':
+          description: Account cannot cover the additional trustline reserve
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /contract/wallet/assets/build:
+    post:
+      tags: [contract]
+      summary: Build unsigned XDR to add a wallet asset
+      operationId: buildAddWalletAsset
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [user, asset]
+              properties:
+                user:
+                  $ref: '#/components/schemas/StellarAddress'
+                asset:
+                  $ref: '#/components/schemas/AssetInfo'
+      responses:
+        '200':
+          description: Unsigned Soroban transaction XDR
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnsignedXdr'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Asset is already registered on this wallet
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /contract/wallet/assets/remove/build:
+    post:
+      tags: [contract]
+      summary: Build unsigned XDR to remove a wallet asset
+      operationId: buildRemoveWalletAsset
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [user, assetCode]
+              properties:
+                user:
+                  $ref: '#/components/schemas/StellarAddress'
+                assetCode:
+                  type: string
+                  pattern: '^[A-Za-z0-9]{1,12}$'
+      responses:
+        '200':
+          description: Unsigned Soroban transaction XDR
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnsignedXdr'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Asset has an active spend limit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /contract/wallet/guardians/add/build:
+    post:
+      tags: [contract]
+      summary: Build unsigned XDR to add a guardian
+      operationId: buildAddGuardian
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [admin, guardian]
+              properties:
+                admin:
+                  $ref: '#/components/schemas/StellarAddress'
+                guardian:
+                  $ref: '#/components/schemas/StellarAddress'
+      responses:
+        '200':
+          description: Simulated unsigned Soroban transaction and authorization data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PreparedInvocation'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          description: Contract rejected the guardian addition (for example duplicate or maximum reached)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /contract/wallet/guardians/remove/build:
+    post:
+      tags: [contract]
+      summary: Build unsigned XDR to remove a guardian
+      operationId: buildRemoveGuardian
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [admin, guardian]
+              properties:
+                admin:
+                  $ref: '#/components/schemas/StellarAddress'
+                guardian:
+                  $ref: '#/components/schemas/StellarAddress'
+      responses:
+        '200':
+          description: Simulated unsigned Soroban transaction and authorization data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PreparedInvocation'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          description: Contract rejected the guardian removal (for example, because it would violate the recovery threshold)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /contract/wallet/recovery/initiate/build:
+    post:
+      tags: [contract]
+      summary: Build unsigned XDR to initiate social recovery
+      operationId: buildInitiateRecovery
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [guardian, newAdmin]
+              properties:
+                guardian:
+                  $ref: '#/components/schemas/StellarAddress'
+                newAdmin:
+                  $ref: '#/components/schemas/StellarAddress'
+      responses:
+        '200':
+          description: Simulated unsigned Soroban transaction and authorization data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PreparedInvocation'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          description: Contract rejected recovery initiation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /contract/wallet/recovery/approve/build:
+    post:
+      tags: [contract]
+      summary: Build unsigned XDR to approve social recovery
+      operationId: buildApproveRecovery
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [guardian]
+              properties:
+                guardian:
+                  $ref: '#/components/schemas/StellarAddress'
+      responses:
+        '200':
+          description: Simulated unsigned Soroban transaction and authorization data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PreparedInvocation'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          description: Contract rejected the recovery approval
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /contract/wallet/recovery/revoke-approval/build:
+    post:
+      tags: [contract]
+      summary: Build unsigned XDR to revoke a recovery approval
+      operationId: buildRevokeRecoveryApproval
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [guardian]
+              properties:
+                guardian:
+                  $ref: '#/components/schemas/StellarAddress'
+      responses:
+        '200':
+          description: Simulated unsigned Soroban transaction and authorization data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PreparedInvocation'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          description: Contract rejected revocation of the recovery approval
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /contract/wallet/recovery/execute/build:
+    post:
+      tags: [contract]
+      summary: Build unsigned XDR to execute social recovery
+      operationId: buildExecuteRecovery
+      description: Execution is permissionless; sourcePublicKey identifies the fee-paying transaction source.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [sourcePublicKey]
+              properties:
+                sourcePublicKey:
+                  $ref: '#/components/schemas/StellarAddress'
+      responses:
+        '200':
+          description: Simulated unsigned Soroban transaction and authorization data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PreparedInvocation'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          description: Contract rejected recovery execution (for example, quorum or timelock not satisfied)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /contract/wallet/recovery/cancel/build:
+    post:
+      tags: [contract]
+      summary: Build unsigned XDR to cancel social recovery
+      operationId: buildCancelRecovery
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [admin]
+              properties:
+                admin:
+                  $ref: '#/components/schemas/StellarAddress'
+      responses:
+        '200':
+          description: Simulated unsigned Soroban transaction and authorization data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PreparedInvocation'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          description: Contract rejected cancellation of recovery
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /contract/wallet/spend-limit/build:
+    post:
+      tags: [contract]
+      summary: Build unsigned XDR to set a daily spend limit
+      operationId: buildSetSpendLimit
+      description: limit is a decimal asset amount with up to 7 decimal places; zero clears the limit and means unlimited.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [user, assetCode, limit]
+              properties:
+                user:
+                  $ref: '#/components/schemas/StellarAddress'
+                assetCode:
+                  type: string
+                  pattern: '^[A-Za-z0-9]{1,12}$'
+                limit:
+                  type: string
+                  pattern: '^\d+(\.\d{1,7})?$'
+                  description: Decimal asset amount; zero means unlimited. Converted exactly to stroops and must fit a Soroban i128.
+      responses:
+        '200':
+          description: Simulated unsigned Soroban transaction and authorization data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PreparedInvocation'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          description: Contract rejected the spend limit (for example, current-day spending exceeds the proposed limit)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /wallet/send:
+    post:
+      tags: [wallet]
+      summary: Legacy secret-key payment route
+      description: Deprecated. Stop sending secret keys to the API; use wallet-native signing.
+      deprecated: true
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          $ref: '#/components/responses/DeprecatedLegacy'
+        '401':
+          $ref: '#/components/responses/DeprecatedUnauthorized'
+  /wallet/fee-bump:
+    post:
+      tags: [wallet]
+      summary: Legacy secret-key fee-bump route
+      description: Deprecated. Stop sending fee-source secret keys to the API; see the client-signing migration guide.
+      deprecated: true
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          $ref: '#/components/responses/DeprecatedLegacy'
+        '401':
+          $ref: '#/components/responses/DeprecatedUnauthorized'
+  /wallet/path-payment-strict-send:
+    post:
+      tags: [wallet]
+      summary: Legacy secret-key strict-send path payment
+      description: Deprecated. Stop sending source secret keys to the API; see the client-signing migration guide.
+      deprecated: true
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          $ref: '#/components/responses/DeprecatedLegacy'
+        '401':
+          $ref: '#/components/responses/DeprecatedUnauthorized'
+  /wallet/path-payment-strict-receive:
+    post:
+      tags: [wallet]
+      summary: Legacy secret-key strict-receive path payment
+      description: Deprecated. Stop sending source secret keys to the API; see the client-signing migration guide.
+      deprecated: true
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          $ref: '#/components/responses/DeprecatedLegacy'
+        '401':
+          $ref: '#/components/responses/DeprecatedUnauthorized'
+  /wallet/partial-transaction:
+    post:
+      tags: [wallet]
+      summary: Legacy secret-key partial-transaction builder
+      description: Deprecated. Stop sending source secret keys to the API; see the client-signing migration guide.
+      deprecated: true
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          $ref: '#/components/responses/DeprecatedLegacy'
+        '401':
+          $ref: '#/components/responses/DeprecatedUnauthorized'
+  /wallet/keypair:
+    post:
+      tags: [wallet]
+      summary: Legacy server-generated keypair route
+      description: Deprecated. Generate and protect account keys in the user's wallet.
+      deprecated: true
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          $ref: '#/components/responses/DeprecatedLegacy'
+        '401':
+          $ref: '#/components/responses/DeprecatedUnauthorized'
+  /contract/wallet/spend:
+    post:
+      tags: [contract]
+      summary: Legacy secret-key spend route
+      description: Deprecated. Stop sending user secret keys to the API; see the client-signing migration guide.
+      deprecated: true
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          $ref: '#/components/responses/DeprecatedLegacy'
+        '401':
+          $ref: '#/components/responses/DeprecatedUnauthorized'
+  /health:
+    get:
+      tags: [health]
+      summary: Health check
+      operationId: getHealth
+      responses:
+        '200':
+          description: Service healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [ok]
+  /health/details:
+    get:
+      tags: [health]
+      summary: Per-dependency health (Horizon, Soroban RPC, Postgres, Redis)
+      description: >-
+        Runs every dependency check in parallel with a 1.5s timeout each and
+        caches the result for 10 seconds. Redis is reported as skipped unless
+        LOCK_BACKEND=redis. Returns 503 when Horizon or Soroban RPC is down.
+      operationId: getHealthDetails
+      responses:
+        '200':
+          description: All core dependencies reachable (status ok or degraded)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthDetails' }
+        '503':
+          description: A core dependency is down
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthDetails' }
+  /network/fees:
+    get:
+      tags: [network]
+      summary: Low/normal/high per-operation fees from Horizon fee stats (#13)
+      description: >-
+        p10/p50/p90 of recent fees, never below the 100-stroop base fee.
+        Cached for 5 seconds. Falls back to the base fee for every tier
+        with source "fallback" when Horizon is unreachable.
+      operationId: getNetworkFees
+      responses:
+        '200':
+          description: Fee estimate
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [low, normal, high, ledgerCapacityUsage, source]
+                properties:
+                  low: { $ref: '#/components/schemas/FeeTier' }
+                  normal: { $ref: '#/components/schemas/FeeTier' }
+                  high: { $ref: '#/components/schemas/FeeTier' }
+                  ledgerCapacityUsage: { type: string, example: "0.42" }
+                  source: { type: string, enum: [horizon, fallback] }
+  /assets/verified:
+    get:
+      tags: [assets]
+      summary: Reviewed verified-asset list for this network (#54)
+      operationId: getVerifiedAssets
+      responses:
+        '200':
+          description: Verified assets
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [network, assets]
+                properties:
+                  network: { type: string, enum: [testnet, mainnet] }
+                  assets:
+                    type: array
+                    items:
+                      type: object
+                      required: [code, issuer, domain, name]
+                      properties:
+                        code: { type: string }
+                        issuer: { type: string }
+                        domain: { type: string }
+                        name: { type: string }
+  /dev/fund:
+    post:
+      tags: [dev]
+      summary: Fund a testnet account via Friendbot (#69, testnet only)
+      description: Not mounted on mainnet (404). An already-funded account returns alreadyFunded true.
+      operationId: fundTestnetAccount
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [account]
+              properties:
+                account: { type: string, description: G... address }
+      responses:
+        '200':
+          description: Funded
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [account, funded, alreadyFunded]
+                properties:
+                  account: { type: string }
+                  funded: { type: boolean }
+                  alreadyFunded: { type: boolean }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '502':
+          description: Friendbot unreachable or refused
+  /pending-txs:
+    post:
+      tags: [multisig]
+      summary: Share a partially signed transaction with co-signers (#74)
+      operationId: createPendingTx
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [xdr]
+              properties:
+                xdr: { type: string, description: Classic transaction envelope (base64) }
+      responses:
+        '201':
+          description: Stored
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PendingTx' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          description: Caller is not a signer of the source account
+    get:
+      tags: [multisig]
+      summary: List open pending transactions for an account (#74)
+      operationId: listPendingTxs
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: account
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Open pending transactions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/PendingTx' }
+  /pending-txs/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [multisig]
+      summary: Fetch a pending transaction to sign (#74)
+      operationId: getPendingTx
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Pending transaction
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PendingTx' }
+        '404':
+          description: Not found
+    delete:
+      tags: [multisig]
+      summary: Cancel a pending transaction (creator only) (#74)
+      operationId: cancelPendingTx
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Cancelled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PendingTx' }
+  /pending-txs/{id}/signatures:
+    post:
+      tags: [multisig]
+      summary: Add signatures from a co-signer's signed copy (#74)
+      operationId: addPendingTxSignatures
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [xdr]
+              properties:
+                xdr: { type: string }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PendingTx' }
+        '409':
+          description: Different transaction, or no longer open
+  /me/preferences:
+    get:
+      tags: [account]
+      summary: The caller's preferences (#68)
+      operationId: getPreferences
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Preferences ({} when unset)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  preferences: { $ref: '#/components/schemas/Preferences' }
+    put:
+      tags: [account]
+      summary: Set any subset of preference keys (#68)
+      operationId: updatePreferences
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Preferences' }
+      responses:
+        '200':
+          description: Merged preferences
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  preferences: { $ref: '#/components/schemas/Preferences' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+    apiKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      deprecated: true
+      description: Deprecated. Use bearerAuth instead.
+  parameters:
+    Page:
+      name: page
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+    PageSize:
+      name: pageSize
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+    WalletId:
+      name: walletId
+      in: path
+      required: true
+      schema:
+        type: string
+    StellarAddress:
+      name: address
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/StellarAddress'
+    ContractId:
+      name: contractId
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/ContractAddress'
+    Asset:
+      name: asset
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Asset'
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    Unauthorized:
+      description: Missing or invalid credentials
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    Conflict:
+      description: Resource already exists
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    DeprecatedLegacy:
+      description: Legacy response. This operation is deprecated and will be sunset on January 1, 2027.
+      headers:
+        Deprecation:
+          schema: { type: string, example: '@1798761600' }
+        Sunset:
+          schema: { type: string, example: 'Fri, 01 Jan 2027 00:00:00 GMT' }
+        Link:
+          schema: { type: string, example: '</docs/client-signing>; rel="deprecation"' }
+    DeprecatedUnauthorized:
+      description: Missing or invalid credentials; deprecation headers are still present.
+      headers:
+        Deprecation:
+          schema: { type: string, example: '@1798761600' }
+        Sunset:
+          schema: { type: string, example: 'Fri, 01 Jan 2027 00:00:00 GMT' }
+        Link:
+          schema: { type: string, example: '</docs/client-signing>; rel="deprecation"' }
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+  schemas:
+    UpgradeEvent:
+      type: object
+      required: [kind, eventId, ledger, actor, wasmHash]
+      properties:
+        kind: { type: string, enum: [proposed, executed] }
+        eventId: { type: string }
+        ledger: { type: integer }
+        txHash: { type: string }
+        actor: { type: string, description: Proposer or executor address }
+        wasmHash: { type: string, description: Hex-encoded WASM hash }
+        readyAtLedger: { type: integer, description: Only for proposed }
+        estimatedExecutableAt: { type: string, format: date-time, nullable: true }
+    FeeTier:
+      type: object
+      required: [stroops, xlm]
+      properties:
+        stroops: { type: string, example: "100" }
+        xlm: { type: string, example: "0.0000100" }
+    PendingTx:
+      type: object
+      required: [id, account, xdr, hash, requiredWeight, collectedWeight, collectedSigners, status]
+      properties:
+        id: { type: string }
+        account: { type: string }
+        xdr: { type: string }
+        hash: { type: string }
+        requiredWeight: { type: integer }
+        collectedWeight: { type: integer }
+        collectedSigners: { type: array, items: { type: string } }
+        createdBy: { type: string }
+        expiresAt: { type: [string, 'null'], format: date-time }
+        status: { type: string, enum: [pending, ready, submitted, cancelled, expired] }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+    Preferences:
+      type: object
+      additionalProperties: false
+      properties:
+        currency: { type: string, maxLength: 16 }
+        language: { type: string, minLength: 2, maxLength: 16 }
+        hiddenAssets: { type: array, maxItems: 500, items: { type: string } }
+        notifications:
+          type: object
+          additionalProperties: false
+          properties:
+            email: { type: boolean }
+            push: { type: boolean }
+            payments: { type: boolean }
+    DependencyCheck:
+      type: object
+      required: [ok, latencyMs]
+      properties:
+        ok: { type: boolean }
+        latencyMs: { type: integer }
+        skipped: { type: boolean }
+        error: { type: string }
+    HealthDetails:
+      type: object
+      required: [status, checks]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded, down]
+        checks:
+          type: object
+          required: [horizon, rpc, postgres, redis]
+          properties:
+            horizon: { $ref: '#/components/schemas/DependencyCheck' }
+            rpc: { $ref: '#/components/schemas/DependencyCheck' }
+            postgres: { $ref: '#/components/schemas/DependencyCheck' }
+            redis: { $ref: '#/components/schemas/DependencyCheck' }
+    ClientConfig:
+      type: object
+      required:
+        - network
+        - networkPassphrase
+        - horizonUrl
+        - sorobanRpcUrl
+        - contracts
+        - features
+        - apiVersion
+        - minClientVersion
+      properties:
+        network:
+          type: string
+          enum: [testnet, mainnet]
+        networkPassphrase:
+          type: string
+        horizonUrl:
+          type: string
+          format: uri
+        sorobanRpcUrl:
+          type: string
+          format: uri
+        contracts:
+          type: object
+          required: [globeWallet, tokenWrapper]
+          properties:
+            globeWallet:
+              type: object
+              required: [contractId, pendingUpgrade]
+              properties:
+                contractId:
+                  oneOf:
+                    - $ref: '#/components/schemas/ContractAddress'
+                    - type: 'null'
+                pendingUpgrade:
+                  oneOf:
+                    - type: object
+                      additionalProperties: true
+                    - type: 'null'
+            tokenWrapper:
+              oneOf:
+                - $ref: '#/components/schemas/ContractAddress'
+                - type: 'null'
+        features:
+          type: object
+          required: [contract]
+          properties:
+            contract:
+              type: boolean
+        apiVersion:
+          type: string
+        minClientVersion:
+          type: string
+    AssetInfo:
+      type: object
+      additionalProperties: false
+      required: [code, issuer]
+      properties:
+        code:
+          type: string
+          minLength: 1
+          maxLength: 12
+          pattern: '^[A-Za-z0-9]{1,12}$'
+        issuer:
+          oneOf:
+            - $ref: '#/components/schemas/StellarAddress'
+            - type: 'null'
+          description: Null is valid only for native XLM.
+      oneOf:
+        - properties:
+            code:
+              const: XLM
+            issuer:
+              type: 'null'
+        - properties:
+            code:
+              not:
+                const: XLM
+            issuer:
+              $ref: '#/components/schemas/StellarAddress'
+    TrustlineBuildRequest:
+      type: object
+      additionalProperties: false
+      required: [account, asset]
+      properties:
+        account:
+          $ref: '#/components/schemas/StellarAddress'
+        asset:
+          type: object
+          additionalProperties: false
+          required: [code, issuer]
+          properties:
+            code:
+              type: string
+              minLength: 1
+              maxLength: 12
+              pattern: '^[A-Za-z0-9]{1,12}$'
+              not:
+                const: XLM
+            issuer:
+              $ref: '#/components/schemas/StellarAddress'
+        limit:
+          type: string
+          pattern: '^(?:0|[1-9]\d*)(?:\.\d{1,7})?$'
+          description: Positive decimal trustline limit, or any zero-valued decimal string to remove the trustline.
+    TrustlineBuildResponse:
+      type: object
+      required: [xdr, networkPassphrase, reserveDelta, spendableXlmAfter]
+      properties:
+        xdr:
+          type: string
+        networkPassphrase:
+          type: string
+        reserveDelta:
+          type: string
+          enum: ['0.5', '-0.5', '0']
+          description: Reserve change for this account; sponsored trustline removal may have no effect.
+        spendableXlmAfter:
+          $ref: '#/components/schemas/Amount'
+    UnsignedXdr:
+      type: object
+      required: [xdr]
+      properties:
+        xdr:
+          type: string
+    PreparedInvocation:
+      type: object
+      required: [xdr, networkPassphrase, fee, sequence, timeBounds, expiresAt, minResourceFee, authEntries, latestLedger]
+      properties:
+        xdr:
+          type: string
+          description: Base64 XDR of the unsigned transaction envelope.
+        networkPassphrase:
+          type: string
+        fee:
+          type: string
+          description: Total inclusion fee in stroops.
+        sequence:
+          type: string
+        timeBounds:
+          type: object
+          required: [minTime, maxTime]
+          properties:
+            minTime:
+              type: string
+            maxTime:
+              type: string
+        expiresAt:
+          type: [string, 'null']
+          format: date-time
+        minResourceFee:
+          type: string
+          description: Soroban resource fee in stroops.
+        authEntries:
+          type: array
+          items:
+            type: string
+          description: Authorization entries in base64 XDR.
+        latestLedger:
+          type: integer
+          description: Ledger sequence used for simulation.
+    DeprecationHeaders:
+      type: object
+      properties:
+        Deprecation:
+          type: string
+          example: '@1798761600'
+        Sunset:
+          type: string
+          example: Fri, 01 Jan 2027 00:00:00 GMT
+        Link:
+          type: string
+          example: '</docs/client-signing>; rel="deprecation"'
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: Stable machine-readable error code
+              enum:
+                - VALIDATION_ERROR
+                - UNAUTHORIZED
+                - FORBIDDEN
+                - NOT_FOUND
+                - CONFLICT
+                - RATE_LIMITED
+                - INTERNAL_ERROR
+                - INSUFFICIENT_RESERVE
+                - ASSET_ISSUER_NOT_FOUND
+                - ASSET_ALREADY_ADDED
+                - TRUSTLINE_NOT_FOUND
+                - TRUSTLINE_HAS_BALANCE
+                - ASSET_HAS_ACTIVE_SPEND_LIMIT
+            message:
+              type: string
+            requestId:
+              type: string
+              description: Inbound request correlation identifier
+            traceId:
+              type: string
+              description: OpenTelemetry W3C distributed tracing identifier
+            details:
+              type: object
+              additionalProperties: true
+    Amount:
+      type: string
+      pattern: '^\d+(\.\d{1,7})?$'
+      description: Decimal amount as a string with up to 7 fractional digits
+      examples: ['100.0000000', '0.5']
+    StellarAddress:
+      type: string
+      pattern: '^G[A-Z2-7]{55}$'
+      description: Stellar account public key (ed25519, base32)
+      examples: ['GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF']
+    ContractAddress:
+      type: string
+      pattern: '^C[A-Z2-7]{55}$'
+      description: Soroban contract address (strkey, base32)
+      examples: ['CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4']
+    Asset:
+      type: object
+      required: [code]
+      properties:
+        code:
+          type: string
+          minLength: 1
+          maxLength: 12
+        issuer:
+          $ref: '#/components/schemas/StellarAddress'
+      description: Native asset omits issuer; issued assets require it
+    PaginatedResponse:
+      type: object
+      required: [data, page, pageSize, total]
+      properties:
+        data:
+          type: array
+          items: {}
+        page:
+          type: integer
+          minimum: 1
+        pageSize:
+          type: integer
+          minimum: 1
+        total:
+          type: integer
+          minimum: 0
+    User:
+      type: object
+      required: [id, email]
+      properties:
+        id:
+          type: string
+        email:
+          type: string
+          format: email
+    AuthResponse:
+      type: object
+      required: [token, user]
+      properties:
+        token:
+          type: string
+        user:
+          $ref: '#/components/schemas/User'
+    Wallet:
+      type: object
+      required: [id, name, address]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        address:
+          $ref: '#/components/schemas/StellarAddress'
+        createdAt:
+          type: string
+          format: date-time
+    Account:
+      type: object
+      required: [address, sequence]
+      properties:
+        address:
+          $ref: '#/components/schemas/StellarAddress'
+        sequence:
+          type: string
+        balances:
+          type: array
+          items:
+            $ref: '#/components/schemas/Balance'
+    Balance:
+      type: object
+      required: [asset, balance]
+      properties:
+        asset:
+          $ref: '#/components/schemas/Asset'
+        balance:
+          $ref: '#/components/schemas/Amount'
+    Contract:
+      type: object
+      required: [id]
+      properties:
+        id:
+          $ref: '#/components/schemas/ContractAddress'
+        wasmHash:
+          type: string
+        methods:
+          type: array
+          items:
+            type: string
+    Price:
+      type: object
+      required: [asset, price, timestamp]
+      properties:
+        asset:
+          $ref: '#/components/schemas/Asset'
+        price:
+          $ref: '#/components/schemas/Amount'
+        timestamp:
+          type: string
+          format: date-time

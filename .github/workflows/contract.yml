@@ -22,7 +22,7 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -32,3 +32,51 @@ jobs:
 
       - name: Test workspace
         run: cargo test --workspace
+
+  supply-chain:
+    # Issue #183: advisories, licenses, banned crates, and proof that the
+    # vendored ed25519-dalek is an unmodified crates.io copy.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: contract
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify vendored ed25519-dalek matches crates.io
+        run: ./scripts/verify-vendored-ed25519.sh
+
+      - name: cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: contract/Cargo.toml
+          command: check advisories bans licenses sources
+
+      - name: cargo-audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo generate-lockfile
+          cargo audit
+
+  wasm-size:
+    # Issue #183: report WASM size per contract and fail if crypto crates
+    # are linked into WASM.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: contract
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Build and report WASM sizes
+        run: ./scripts/wasm-size.sh

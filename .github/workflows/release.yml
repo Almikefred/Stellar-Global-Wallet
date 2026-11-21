@@ -29,22 +29,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           registry-url: "https://registry.npmjs.org"
 
       - name: Install workspace dependencies
-        run: npm install
+        run: npm ci
 
       - name: Build publishable packages
-        run: npm run build --workspaces --if-present
+        run: npm run build:packages
 
       - name: Dry-run publish (no tags, no npm writes)
         run: npx changeset publish --dry-run
@@ -54,22 +54,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           registry-url: "https://registry.npmjs.org"
 
       - name: Install workspace dependencies
-        run: npm install
+        run: npm ci
 
       - name: Build publishable packages
-        run: npm run build --workspaces --if-present
+        run: npm run build:packages
 
       - name: Create release PR or publish to npm
         uses: changesets/action@v1

@@ -23,40 +23,28 @@ function loadJson(relPath: string): Record<string, string> {
 }
 
 // ── Canonical error codes ──────────────────────────────────────────────────
-// Keep in sync with:
-//   backend/src/errors/appError.ts
-//   backend/src/services/stellarErrors.ts
-//   backend/src/services/sorobanErrors.ts
-const REQUIRED_ERROR_KEYS: string[] = [
-  "INTERNAL_ERROR",
-  "NOT_FOUND",
-  "ROUTE_NOT_FOUND",
-  "UNAUTHORIZED",
-  "PAYLOAD_TOO_LARGE",
-  "VALIDATION_ERROR",
-  "SEQUENCE_CONFLICT",
-  "MEMO_REQUIRED",
-  "LOCK_TIMEOUT",
-  "HORIZON_REJECTED",
-  "SOROBAN_NOT_CONFIGURED",
-  "SOROBAN_SIMULATION_FAILED",
-  "SOROBAN_TX_FAILED",
-  "DEVICE_NOT_FOUND",
-  "REQUEST_ERROR",
-  "ENTITY_TOO_LARGE",
-  "RATE_LIMIT_EXCEEDED",
-  "EMAIL_ALREADY_VERIFIED",
-  "EMAIL_NOT_VERIFIED",
-  "EMAIL_TOKEN_EXPIRED",
-  "EMAIL_TOKEN_INVALID",
-  "EMAIL_SEND_FAILED",
-];
+// Read straight from backend/src/errors/codes.ts (the ERROR_CODES list) so a
+// new backend code can never ship without copy. A hand-maintained list here
+// drifted badly: most codes the API returns were missing.
+function loadBackendErrorCodes(): string[] {
+  const codesPath = path.resolve(root, "..", "..", "backend", "src", "errors", "codes.ts");
+  const source = fs.readFileSync(codesPath, "utf-8");
+  const start = source.indexOf("ERROR_CODES = [");
+  const end = source.indexOf("] as const", start);
+  if (start === -1 || end === -1) {
+    throw new Error(`Could not find the ERROR_CODES list in ${codesPath}`);
+  }
+  return [...source.slice(start, end).matchAll(/"([A-Z0-9_]+)"/g)].map((m) => m[1]);
+}
+
+const REQUIRED_ERROR_KEYS: string[] = loadBackendErrorCodes();
 
 // ── Canonical notification keys ────────────────────────────────────────────
 // Keep in sync with:
 //   backend/src/services/paymentNotifier.ts
 //   backend/src/services/recoveryNotifier.ts
 //   backend/src/services/emailNotifier.ts
+//   backend/src/services/assetMigrationNotifier.ts
 const REQUIRED_NOTIFICATION_KEYS: string[] = [
   "payment.received.title",
   "payment.received.body",
@@ -76,6 +64,9 @@ const REQUIRED_NOTIFICATION_KEYS: string[] = [
   "email.recovery_initiated.body",
   "email.large_send.subject",
   "email.large_send.body",
+  "migration.asset_untracked.title",
+  "migration.asset_untracked.body",
+  "migration.asset_untracked.body_limited",
 ];
 
 function check(
@@ -96,7 +87,21 @@ const missingNotifications = check(
   REQUIRED_NOTIFICATION_KEYS
 );
 
+// Unused keys: catalogue entries nothing requires any more (dead copy).
+const unused = [
+  ...Object.keys(errorsEn).filter((k) => !REQUIRED_ERROR_KEYS.includes(k)).map((k) => `errors/en.json: ${k}`),
+  ...Object.keys(notificationsEn)
+    .filter((k) => !REQUIRED_NOTIFICATION_KEYS.includes(k))
+    .map((k) => `notifications/en.json: ${k}`),
+];
+
 let failed = false;
+
+if (unused.length > 0) {
+  console.error("❌  Unused catalogue keys (remove them or reference them):");
+  unused.forEach((k) => console.error(`   - ${k}`));
+  failed = true;
+}
 
 if (missingErrors.length > 0) {
   console.error("❌  Missing keys in errors/en.json:");

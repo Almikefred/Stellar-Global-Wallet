@@ -12,3 +12,7 @@ node_modules/
 dist/
 
 # Per-package rules live in backend/.gitignore and contract/.gitignore
+
+# Local change-summary files (not for version control)
+CHANGES-*.md
+CHANGES.md

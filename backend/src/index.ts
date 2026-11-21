@@ -1,18 +1,48 @@
 import "dotenv/config";
 import { config } from "./config";
 import { createApp } from "./app";
-import { ensureAuditTable } from "./db";
+import { ensureAuditTable, pool } from "./db";
+import { initKeys } from "./utils/jwtKeys";
+import { BuiltTransactionRegistry, PgBuiltTransactionStore } from "./services/builtTransactions";
 import { StellarService } from "./services/stellar";
 import { createAccountLock } from "./services/locks/createAccountLock";
 import { startPaymentNotifier } from "./services/paymentNotifier";
 import { startRecoveryNotifier } from "./services/recoveryNotifier";
+import { getVerifiedAssets } from "./services/verifiedAssets";
+import { startTtlKeeper } from "./services/ttlKeeper";
+import { startUpgradeWatcher } from "./services/upgradeWatcher";
+import { startInvalidationListener } from "./services/sorobanCache";
+import { startActivityFeedIndexer } from "./services/activityFeed";
+import { shutdownManager } from "./services/shutdown";
+import { assertNetworkConfigurationMatches } from "./utils/networkCheck";
 
 async function main() {
+  // #223 — Multi-network safety: verify Horizon and Soroban RPC endpoints match config
+  if (config.NODE_ENV !== "test") {
+    try {
+      const netInfo = await assertNetworkConfigurationMatches();
+      console.log(
+        `[network-check] Verified network matches ${netInfo.expectedNetwork} ("${netInfo.horizonPassphrase}")`
+      );
+    } catch (err) {
+      console.error("[network-check] Fatal network mismatch error:", (err as Error).message);
+      process.exit(1);
+    }
+  }
+
+  // #54 — fail fast on a malformed verified-asset list rather than on the
+  // first request that needs it.
+  getVerifiedAssets();
+
   const { lock, shutdown } = await createAccountLock();
-  const stellar = new StellarService(lock);
+  // #194 — /wallet/submit only relays envelopes built by this API.
+  const builtTxs = new BuiltTransactionRegistry(new PgBuiltTransactionStore(pool), config.NETWORK_PASSPHRASE);
+  const stellar = new StellarService(lock, builtTxs);
   const app = createApp(stellar);
 
   await ensureAuditTable();
+  // #199 — load (or generate on first boot) asymmetric JWT signing keys.
+  await initKeys();
 
   const server = app.listen(config.PORT, () => {
     console.log(
@@ -30,11 +60,41 @@ async function main() {
     console.error("[recovery-notifier] fatal error", err.message);
   });
 
+  // #86 — start cross-instance cache invalidation listener.
+  void startInvalidationListener().catch((err: Error) => {
+    console.error("[soroban-cache] failed to start invalidation listener", err.message);
+  });
+
+  // #79 — activity feed indexer for contract events
+  const stopActivityFeedIndexer = startActivityFeedIndexer(stellar);
+
+  // #185 — keep active wallets' persistent entries from archiving.
+  const stopTtlKeeper = startTtlKeeper();
+  // #186 — announce proposed/executed contract upgrades.
+  const stopUpgradeWatcher = startUpgradeWatcher();
+
   const shutdownGracefully = async (signal: string) => {
-    console.log(`${signal} received, shutting down`);
-    server.close(async () => {
-      await shutdown();
-      process.exit(0);
+    console.log(`[shutdown] ${signal} received, beginning graceful shutdown`);
+    await shutdownManager.initiateShutdown(server, {
+      timeoutMs: config.SHUTDOWN_TIMEOUT_MS,
+      onDrainStart: () => {
+        stopActivityFeedIndexer();
+        stopTtlKeeper();
+        stopUpgradeWatcher();
+      },
+      onDrainComplete: async () => {
+        try {
+          await shutdown();
+        } catch (err) {
+          console.error("[shutdown] Error releasing account locks:", err);
+        }
+        try {
+          await pool.end();
+        } catch (err) {
+          console.error("[shutdown] Error closing database pool:", err);
+        }
+        process.exit(0);
+      },
     });
   };
 
