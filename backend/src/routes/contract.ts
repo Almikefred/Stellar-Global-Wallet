@@ -1,9 +1,12 @@
 import { Router } from "express";
 import { body, param } from "express-validator";
+import * as StellarSdk from "@stellar/stellar-sdk";
+import { config } from "../config";
 import { assertValidRequest, rejectUnknownBodyFields } from "../middleware/requestValidation";
 import { GlobeWalletContract } from "../services/contracts/globeWallet";
 import { jwtAuth } from "../middleware/jwtAuth";
-import { requireAccountMatch } from "../middleware/requireAccountMatch";
+import { assertSignedXdrAccountMatch, requireAccountMatch } from "../middleware/requireAccountMatch";
+import { baseAccountId } from "../services/transactionEnvelope";
 import { deprecated } from "../middleware/deprecated";
 import { isGAddress, publicKeyMessage } from "../utils/stellarAddress";
 import { toStroops } from "../utils/stroops";
@@ -468,6 +471,27 @@ export function createContractRouter(globeWallet: GlobeWalletContract): Router {
     async (req, res, next) => {
       try {
         assertValidRequest(req);
+        // #233 — enforce account scoping on the signed XDR's source account when
+        // authenticated as a specific Stellar account (G...). Malformed XDR falls
+        // through to `globeWallet.submitSigned` so it returns 400 INVALID_TRANSACTION.
+        const sub = req.user?.sub;
+        if (sub && StellarSdk.StrKey.isValidEd25519PublicKey(sub)) {
+          let tx: StellarSdk.Transaction | StellarSdk.FeeBumpTransaction | undefined;
+          try {
+            tx = StellarSdk.TransactionBuilder.fromXDR(
+              req.body.signedXdr,
+              config.SOROBAN_NETWORK_PASSPHRASE
+            );
+          } catch {
+            tx = undefined;
+          }
+          if (tx) {
+            const inner = "innerTransaction" in tx ? tx.innerTransaction : tx;
+            const feeSource =
+              "innerTransaction" in tx ? baseAccountId(tx.feeSource) : undefined;
+            assertSignedXdrAccountMatch(sub, baseAccountId(inner.source), feeSource);
+          }
+        }
         const result = await shutdownManager.trackSubmission(() =>
           globeWallet.submitSigned(req.body.signedXdr)
         );

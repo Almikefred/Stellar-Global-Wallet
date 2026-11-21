@@ -1,12 +1,12 @@
 import { Router } from "express";
 import { param, query } from "express-validator";
 import { assertValidRequest } from "../middleware/requestValidation";
+import { jwtAuth } from "../middleware/jwtAuth";
+import { requireAccountMatch } from "../middleware/requireAccountMatch";
+import { AppError, NotFoundError } from "../errors/appError";
 import { StellarService } from "../services/stellar";
 import { isValidAccountId } from "../validation/historyQuery";
 import { PgTransactionStore, TransactionSubmitter } from "../services/transactionStatus";
-import { HorizonService } from "../services/horizonService";
-import { AccountLock, InProcessAccountLock } from "../services/locks/accountLock";
-import { BuiltTransactionRegistry } from "../services/builtTransactions";
 import { config } from "../config";
 import * as StellarSdk from "@stellar/stellar-sdk";
 
@@ -18,9 +18,73 @@ import * as StellarSdk from "@stellar/stellar-sdk";
 export function createTransactionsRouter(
   stellar?: StellarService,
   txStore?: PgTransactionStore,
-  txSubmitter?: TransactionSubmitter
+  _txSubmitter?: TransactionSubmitter
 ): Router {
   const router = Router();
+
+  // Transaction status endpoint (for async submission) — registered before `/:hash`
+  // so `/status/:hash` is matched explicitly rather than falling through.
+  router.get(
+    "/status/:hash",
+    param("hash")
+      .matches(/^[0-9a-fA-F]{64}$/)
+      .withMessage("hash must be a 64-character hex transaction hash"),
+    async (req, res, next) => {
+      try {
+        assertValidRequest(req);
+
+        if (!txStore) {
+          throw new AppError("Transaction status tracking not configured", {
+            code: "SERVICE_UNAVAILABLE",
+            status: 503,
+            retryable: false,
+          });
+        }
+
+        const hash = req.params.hash.toLowerCase();
+        const record = await txStore.get(hash);
+
+        if (!record) {
+          throw new NotFoundError("Transaction not found", "TRANSACTION_NOT_FOUND");
+        }
+
+        res.json(record);
+      } catch (err) {
+        next(err);
+      }
+    }
+  );
+
+  // Per-account submission status feed — authenticated & account-scoped (#233)
+  // because pending/failed submission records are user-private operational state.
+  router.get(
+    "/account/:accountId/statuses",
+    jwtAuth,
+    requireAccountMatch((req) => req.params.accountId),
+    param("accountId").custom(isValidAccountId).withMessage("account must be a valid G... address"),
+    query("limit").optional().isInt({ min: 1, max: 100 }).withMessage("limit must be between 1 and 100"),
+    async (req, res, next) => {
+      try {
+        assertValidRequest(req);
+
+        if (!txStore) {
+          throw new AppError("Transaction status tracking not configured", {
+            code: "SERVICE_UNAVAILABLE",
+            status: 503,
+            retryable: false,
+          });
+        }
+
+        const accountId = req.params.accountId;
+        const limit = parseInt(req.query.limit as string, 10) || 20;
+
+        const records = await txStore.listForAccount(accountId, limit);
+        res.json({ transactions: records });
+      } catch (err) {
+        next(err);
+      }
+    }
+  );
 
   // Existing transaction detail endpoint (public read)
   router.get(
@@ -35,21 +99,19 @@ export function createTransactionsRouter(
     async (req, res, next) => {
       try {
         assertValidRequest(req);
-        
+
         if (stellar) {
-          // Use existing service for backward compatibility
           const detail = await stellar.getTransactionDetail(
             req.params.hash.toLowerCase(),
             req.query.account as string | undefined
           );
           res.json(detail);
         } else if (txStore) {
-          // Use transaction status store for newer deployments
           const hash = req.params.hash.toLowerCase();
           const record = await txStore.get(hash);
-          
+
           if (!record) {
-            return res.status(404).json({ error: "Transaction not found" });
+            throw new NotFoundError("Transaction not found", "TRANSACTION_NOT_FOUND");
           }
 
           res.json({
@@ -69,60 +131,12 @@ export function createTransactionsRouter(
             explorerUrl: null,
           });
         } else {
-          res.status(500).json({ error: "Service not configured" });
+          throw new AppError("Service not configured", {
+            code: "SERVICE_UNAVAILABLE",
+            status: 503,
+            retryable: false,
+          });
         }
-      } catch (err) {
-        next(err);
-      }
-    }
-  );
-
-  // New transaction status endpoint (for async submission)
-  router.get(
-    "/status/:hash",
-    param("hash")
-      .matches(/^[0-9a-fA-F]{64}$/)
-      .withMessage("hash must be a 64-character hex transaction hash"),
-    async (req, res, next) => {
-      try {
-        assertValidRequest(req);
-        
-        if (!txStore) {
-          return res.status(500).json({ error: "Transaction status tracking not configured" });
-        }
-
-        const hash = req.params.hash.toLowerCase();
-        const record = await txStore.get(hash);
-        
-        if (!record) {
-          return res.status(404).json({ error: "Transaction not found" });
-        }
-
-        res.json(record);
-      } catch (err) {
-        next(err);
-      }
-    }
-  );
-
-  // Transaction history for an account
-  router.get(
-    "/account/:accountId/statuses",
-    param("accountId").custom(isValidAccountId).withMessage("account must be a valid G... address"),
-    query("limit").optional().isInt({ min: 1, max: 100 }).withMessage("limit must be between 1 and 100"),
-    async (req, res, next) => {
-      try {
-        assertValidRequest(req);
-        
-        if (!txStore) {
-          return res.status(500).json({ error: "Transaction status tracking not configured" });
-        }
-
-        const accountId = req.params.accountId;
-        const limit = parseInt(req.query.limit as string) || 20;
-        
-        const records = await txStore.listForAccount(accountId, limit);
-        res.json({ transactions: records });
       } catch (err) {
         next(err);
       }
