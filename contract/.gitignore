@@ -8,3 +8,6 @@ Cargo.lock
 # Written by scripts/deploy-local.sh — contract IDs are specific to
 # whichever ephemeral local network container produced them.
 deployments/local.json
+
+# The vendored crate must match crates.io byte for byte, including its Cargo.lock.
+!vendor/ed25519-dalek-2.2.0/Cargo.lock
