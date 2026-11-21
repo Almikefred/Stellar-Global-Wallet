@@ -239,6 +239,11 @@ const envSchema = z.object({
     .enum(["true", "false"])
     .optional()
     .transform((v) => (v === undefined ? process.env.NODE_ENV !== "production" : v === "true")),
+
+  // #124 — Expo push token TTL. Tokens are pruned after this many seconds
+  // (default: 90 days). Expo tokens are time-limited; clients must re-register
+  // before expiry or they will stop receiving notifications.
+  EXPO_TOKEN_TTL_SECONDS: z.coerce.number().int().positive().default(90 * 24 * 60 * 60),
 });
 
 export const config = envSchema.parse(process.env);
