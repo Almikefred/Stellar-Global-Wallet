@@ -48,10 +48,200 @@ info:
     and Horizon/Soroban transient failures) may be retried with backoff. Codes
     such as `REFRESH_TOKEN_INVALID` and `ROUTE_NOT_FOUND` are not retryable and
     require the client to re-authenticate or correct the request.
+
+    ## Outbound webhooks (#279)
+
+    Integrators can subscribe to wallet events via webhook endpoints. Every
+    delivery is signed with HMAC-SHA256 over the raw request body using the
+    endpoint's active secret. The signature is sent in the
+    `X-Webhook-Signature` header as `t=<unix>,v1=<hex>`; recompute
+    `HMAC_SHA256(secret, "<t>.<rawBody>")` and compare in constant time, and
+    reject timestamps older than 5 minutes to prevent replay.
+
+    Secrets can be rotated: after rotation the previous secret remains valid
+    for a grace window so integrators can roll over without dropping events.
+    Deliveries are retried with exponential backoff; events that exhaust
+    retries are moved to a dead-letter queue and can be replayed. Deliveries
+    are ordered per endpoint. Delivery targets are validated to block
+    private/internal addresses (SSRF-safe).
 servers:
   - url: http://localhost:4000
     description: Local development
-paths: {}
+paths:
+  /api/v1/webhooks/endpoints:
+    get:
+      summary: List webhook endpoints
+      description: Returns the caller's webhook endpoints (secrets are never returned).
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+      responses:
+        '200':
+          description: Webhook endpoints
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [endpoints]
+                properties:
+                  endpoints:
+                    type: array
+                    items: { $ref: "#/components/schemas/WebhookEndpoint" }
+        default:
+          $ref: "#/components/responses/Error"
+    post:
+      summary: Create a webhook endpoint
+      description: >-
+        Registers a delivery URL and the events to subscribe to. The URL is
+        validated and must not resolve to a private/internal address
+        (SSRF-safe). The signing secret is returned once on creation.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WebhookEndpointInput"
+      responses:
+        '201':
+          description: Endpoint created
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookEndpointWithSecret"
+        default:
+          $ref: "#/components/responses/Error"
+  /api/v1/webhooks/endpoints/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    delete:
+      summary: Delete a webhook endpoint
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+      responses:
+        '204':
+          description: Endpoint deleted
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+        default:
+          $ref: "#/components/responses/Error"
+  /api/v1/webhooks/endpoints/{id}/rotate-secret:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    post:
+      summary: Rotate the signing secret
+      description: >-
+        Issues a new signing secret. The previous secret stays valid for a
+        grace window so in-flight deliveries can still be verified.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+      responses:
+        '200':
+          description: New secret
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookEndpointWithSecret"
+        default:
+          $ref: "#/components/responses/Error"
+  /api/v1/webhooks/endpoints/{id}/deliveries:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      summary: List delivery logs for an endpoint
+      description: >-
+        Returns recent delivery attempts for the endpoint, including status,
+        attempt count, response code and whether the event is dead-lettered.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [pending, delivered, failed, dead_letter]
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+      responses:
+        '200':
+          description: Delivery logs
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [deliveries]
+                properties:
+                  deliveries:
+                    type: array
+                    items: { $ref: "#/components/schemas/WebhookDelivery" }
+        default:
+          $ref: "#/components/responses/Error"
+  /api/v1/webhooks/deliveries/{deliveryId}/replay:
+    parameters:
+      - name: deliveryId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    post:
+      summary: Replay a dead-lettered delivery
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+      responses:
+        '202':
+          description: Replay queued
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+        default:
+          $ref: "#/components/responses/Error"
 components:
   securitySchemes:
     bearerAuth:
@@ -81,9 +271,119 @@ components:
         type: string
         pattern: '^[A-Za-z0-9-]{8,64}$'
         example: "3f1c9a2e-7b4d-4c8a-9e6f-1a2b3c4d5e6f"
+  responses:
+    Error:
+      description: Shared error envelope
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/X-Request-Id"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
   schemas:
     ErrorResponse:
       $ref: "./openapi-errors.yaml#/components/schemas/ErrorResponse"
+    WebhookEventType:
+      type: string
+      enum:
+        - wallet.created
+        - wallet.updated
+        - transaction.created
+        - transaction.confirmed
+        - transaction.failed
+        - payment.received
+        - payment.sent
+      description: Wallet event an endpoint can subscribe to.
+    WebhookEndpointInput:
+      type: object
+      required: [url, events]
+      properties:
+        url:
+          type: string
+          format: uri
+          description: >-
+            HTTPS delivery URL. Must not resolve to a private/internal
+            address (SSRF-safe).
+          example: "https://integrator.example.com/hooks/wallet"
+        events:
+          type: array
+          minItems: 1
+          items: { $ref: "#/components/schemas/WebhookEventType" }
+        description:
+          type: string
+          maxLength: 200
+    WebhookEndpoint:
+      type: object
+      required: [id, url, events, status, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        url:
+          type: string
+          format: uri
+        events:
+          type: array
+          items: { $ref: "#/components/schemas/WebhookEventType" }
+        description:
+          type: string
+        status:
+          type: string
+          enum: [active, disabled]
+        createdAt:
+          type: string
+          format: date-time
+        secretRotatedAt:
+          type: string
+          format: date-time
+          nullable: true
+    WebhookEndpointWithSecret:
+      allOf:
+        - $ref: "#/components/schemas/WebhookEndpoint"
+        - type: object
+          required: [secret]
+          properties:
+            secret:
+              type: string
+              description: >-
+                HMAC signing secret. Returned only on creation and rotation;
+                never on subsequent reads.
+    WebhookDelivery:
+      type: object
+      required: [id, endpointId, eventType, status, attempts, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        endpointId:
+          type: string
+          format: uuid
+        eventType:
+          $ref: "#/components/schemas/WebhookEventType"
+        status:
+          type: string
+          enum: [pending, delivered, failed, dead_letter]
+        attempts:
+          type: integer
+          minimum: 0
+        responseCode:
+          type: integer
+          nullable: true
+        lastError:
+          type: string
+          nullable: true
+        nextAttemptAt:
+          type: string
+          format: date-time
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+        deliveredAt:
+          type: string
+          format: date-time
+          nullable: true
     Amount:
       type: string
       pattern: '^\d+(\.\d{1,7})?$'
@@ -222,174 +522,3 @@ components:
           type: string
           description: >-
             Fraction (0–1) of the latest ledger's capacity in use, as a
-            decimal string. "0" when served from the fallback.
-          example: "0.42"
-        source:
-          type: string
-          enum: [horizon, fallback]
-          description: >-
-            `horizon` when the values come from live `/fee_stats`;
-            `fallback` when Horizon was unreachable and the base fee (100
-            stroops) is returned for every tier.
-    ContractFeeEstimate:
-      type: object
-      required: [inclusionFee, resourceFee, totalFee]
-      description: >-
-        Soroban fee estimate for a contract call (#14). Each tier is a
-        `FeeEstimate` (stroops + XLM strings). `inclusionFee` is the classic
-        per-operation inclusion fee; `resourceFee` is the Soroban
-        `minResourceFee` from simulation; `totalFee` is their sum. The
-        estimate matches the fee in the XDR produced by the corresponding
-        build route for the same inputs.
-      properties:
-        inclusionFee:
-          $ref: "#/components/schemas/FeeEstimate"
-        resourceFee:
-          $ref: "#/components/schemas/FeeEstimate"
-        totalFee:
-          $ref: "#/components/schemas/FeeEstimate"
-  responses:
-    ValidationError:
-      description: Input failed validation
-      headers:
-        X-Request-Id: { $ref: "#/components/headers/X-Request-Id" }
-      content:
-        application/json:
-          schema: { $ref: "#/components/schemas/ErrorResponse" }
-          examples:
-            invalid:
-              $ref: "./openapi-errors.yaml#/components/examples/BadRequest400"
-    Unauthorized:
-      description: Missing or invalid bearer token
-      headers:
-        X-Request-Id: { $ref: "#/components/headers/X-Request-Id" }
-      content:
-        application/json:
-          schema: { $ref: "#/components/schemas/ErrorResponse" }
-          example:
-            code: AUTH_HEADER_INVALID
-            error: Missing or malformed Authorization header
-            requestId: "3f1c9a2e-7b4d-4c8a-9e6f-1a2b3c4d5e6f"
-
-paths:
-  /api/v1/network/fees:
-    get:
-      summary: Estimate low/normal/high network fees from Horizon fee stats (#13)
-      description: >-
-        Returns the p10/p50/p90 per-operation fees from Horizon
-        `/fee_stats` so the send flow can offer priority options during
-        surge pricing. Responses are cached in memory for 5 seconds. If
-        Horizon is unreachable the base fee (100 stroops) is returned for
-        every tier with `source: "fallback"`.
-      responses:
-        "200":
-          description: Fee estimate
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/NetworkFeesResponse" }
-              examples:
-                horizon:
-                  value:
-                    low: { stroops: "100", xlm: "0.0000100" }
-                    normal: { stroops: "200", xlm: "0.0000200" }
-                    high: { stroops: "1500", xlm: "0.0001500" }
-                    ledgerCapacityUsage: "0.42"
-                    source: horizon
-                fallback:
-                  value:
-                    low: { stroops: "100", xlm: "0.0000100" }
-                    normal: { stroops: "100", xlm: "0.0000100" }
-                    high: { stroops: "100", xlm: "0.0000100" }
-                    ledgerCapacityUsage: "0"
-                    source: fallback
-
-  /api/v1/contract/wallet/estimate:
-    post:
-      summary: Estimate the Soroban resource fee for a contract call (#14)
-      description: >-
-        Runs simulation only (no XDR is built or returned) and reports the
-        inclusion fee, the Soroban `minResourceFee` and their total so the
-        UI can show the full cost before signing a spend, recovery or
-        guardian change. The estimate matches the fee in the XDR produced
-        by the corresponding build route for the same inputs. If simulation
-        fails the mapped contract error is returned instead of a fee.
-      security: [{ bearerAuth: [] }]
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [action, sourcePublicKey]
-              properties:
-                action:
-                  type: string
-                  enum:
-                    - record_spend
-                    - set_spend_limit
-                    - add_guardian
-                    - remove_guardian
-                    - add_asset
-                    - remove_asset
-                    - recovery_initiate
-                    - recovery_approve
-                    - recovery_revoke
-                    - recovery_execute
-                    - recovery_cancel
-                  description: Contract action to simulate.
-                sourcePublicKey: { $ref: "#/components/schemas/AccountId" }
-                params:
-                  type: object
-                  additionalProperties: true
-                  description: >-
-                    Action-specific parameters, identical to the matching
-                    build route. Amounts are decimal strings.
-      responses:
-        "200":
-          description: Fee estimate
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/ContractFeeEstimate" }
-              example:
-                inclusionFee: { stroops: "100", xlm: "0.0000100" }
-                resourceFee: { stroops: "123456", xlm: "0.0123456" }
-                totalFee: { stroops: "123556", xlm: "0.0123556" }
-        "400":
-          $ref: "#/components/responses/ValidationError"
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "422":
-          description: Simulation failed — mapped contract error, not a fee
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/ErrorResponse" }
-
-  /api/v1/wallet/send/precheck:
-    post:
-      summary: Check a send for problems before signing (#64)
-      description: >-
-        Read-only. Loads the source and destination accounts and reports
-        every known reason the payment would fail or lose funds: destination
-        missing (and whether it would be created), missing/unauthorized
-        trustline, SEP-29 memo required, sending to yourself, and amount
-        above the spendable balance. A well-formed request always returns
-        200; problems come back as warnings.
-      security: [{ bearerAuth: [] }]
-      parameters:
-        - $ref: "#/components/parameters/RequestId"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [sourcePublicKey, destinationPublicKey, amount]
-              properties:
-                sourcePublicKey: { $ref: "#/components/schemas/AccountId" }
-                destinationPublicKey: { $ref: "#/components/schemas/AccountId" }
-                amount: { $ref: "#/components/schemas/Amount" }
-                asset: { $ref: "#/components/schemas/Asset" }
-                memo:
-                  type: string
-                  description: MEMO_TEXT, at most 28 UTF-8 bytes.
-      r
