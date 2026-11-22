@@ -13,11 +13,15 @@ the design changes during review.
 | #257 | [Unified cache with stampede protection](./257-unified-cache.md) | L | none |
 | #258 | [Wallet and contract routes: thin handlers over a service layer](./258-route-service-layer.md) | L | #256 (preferred) |
 | #259 | [SEP-24 / SEP-6 anchor integration](./259-anchor-integration.md) | XL | #256, #257, #258 |
+| #274 | [Encrypted key backup: client-side encryption spec and server blob store](./274-encrypted-key-backup.md) | L | #256 (error envelope) |
 
 **Suggested order:** #256 → #257 → #258 → #259. The error envelope and the
 cache are building blocks that the route refactor and the anchor work both use.
 Doing #258 before #259 means the anchor routes start out as thin handlers
 instead of adding a third large route file.
+
+#274 is independent of the route/cache work but reuses the #256 error envelope
+and stable error codes for its blob API.
 
 > **Note on line counts.** The issues quote file sizes from commit `6fc71e5`
 > (e.g. `wallet.ts` 674 lines, `jsonCache.ts`, `ttlCache.ts`). That commit is
