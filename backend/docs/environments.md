@@ -84,6 +84,47 @@ unavailable or the pipeline fails partway):
 6. Notify frontend developers that the testnet preview is back and the
    contract ID changed.
 
+## Protocol upgrade readiness
+
+Stellar protocol upgrades (and the matching `soroban-sdk` releases) can
+break wallets that aren't prepared. To get early warning, CI runs a
+**next-protocol** job on a weekly schedule (and on manual dispatch) that
+exercises the contract workspace and the backend e2e suite against the
+*next* protocol version rather than the pinned one:
+
+- **Contracts**: `cargo test --workspace` in `contract/` with the next
+  `soroban-sdk` version, so SDK-level breaking changes surface before the
+  upgrade lands on testnet/mainnet.
+- **Backend e2e**: the `backend/tests/e2e` suite against a Stellar
+  Quickstart `future`/next image, so RPC/Horizon behaviour changes are
+  caught end-to-end.
+
+A failing next-protocol run is the early-warning signal: it opens/updates a
+tracking issue (or notifies maintainers) rather than blocking normal PRs.
+The pinned versions used by the regular CI stay unchanged — only this
+scheduled job tracks the next protocol.
+
+### Upgrade checklist
+
+When a protocol/SDK bump is announced, work through this list before
+upgrading the pinned versions:
+
+1. **Read the release notes** for the protocol version and the
+   `soroban-sdk` release; note any breaking changes to host functions,
+   XDR, or RPC.
+2. **Check the next-protocol CI run** — is it green? If not, the failing
+   job's log is the list of breaking changes to address.
+3. **Update `contract/Cargo.toml`** to the new `soroban-sdk` version and run
+   `cargo test --workspace` locally.
+4. **Re-run the backend e2e suite** against the new Quickstart image
+   (`backend/tests/e2e`) and fix any RPC/Horizon behaviour changes.
+5. **Record breaking changes** in the tracking issue opened by the
+   next-protocol job so the upgrade history is auditable.
+6. **Update this doc and the environment matrix** if any URL, passphrase,
+   or contract behaviour changed.
+7. **Deploy to testnet first**, verify `GET /api/v1/config` and a contract
+   read endpoint, then promote.
+
 ## Mainnet: what's actually missing, not just config
 
 The "Mainnet (future)" column above is mostly "not configured yet" rather
