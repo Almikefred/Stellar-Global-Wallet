@@ -29,7 +29,7 @@
 
 import { createClient } from "redis";
 import { config } from "../config";
-import { pool } from "../db";
+import { withServiceRole } from "../db";
 import { getDevicesForAccounts } from "./deviceRegistry";
 import { sendPushToAll } from "./pushSender";
 import { tNotification } from "./i18nHelper";
@@ -262,7 +262,10 @@ async function handlePayment(
     return;
   }
 
-  const devices = await getDevicesForAccounts([account]);
+  const devices = await withServiceRole(
+    (tx) => getDevicesForAccounts([account], tx),
+    { jobName: "paymentNotifier.handlePayment" }
+  );
   if (devices.length === 0) return;
 
   const assetLabel =
