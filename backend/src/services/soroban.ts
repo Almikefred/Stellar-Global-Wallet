@@ -14,6 +14,15 @@ import {
 } from "./sorobanCache";
 import { SourceAccountNotFoundError, TransactionExpiredError } from "./stellarErrors";
 import {
+  installUpstreamHttpGuards,
+  isUpstreamValidationFailure,
+  validateSorobanAccount,
+  validateSorobanGetTransaction,
+  validateSorobanLatestLedger,
+  validateSorobanSendTransaction,
+  validateSorobanSimulation,
+} from "./upstreamValidation";
+import {
   assertNotExpired,
   BUILD_TIMEOUT_SECONDS,
   describeUnsignedTransaction,
@@ -137,8 +146,14 @@ export class SorobanService {
     // doesn't exist on-chain — same fallback as buildUnsignedTransaction.
     let sourceAccount: StellarSdk.Account;
     try {
-      sourceAccount = await this.server.getAccount(sourcePublicKey);
-    } catch {
+      sourceAccount = validateSorobanAccount(
+        await this.server.getAccount(sourcePublicKey),
+        this.maxResponseBytes
+      );
+    } catch (err) {
+      if (isUpstreamValidationFailure(err)) {
+        throw err;
+      }
       sourceAccount = new StellarSdk.Account(sourcePublicKey, "0");
     }
     const tx = this.buildInvocation(sourceAccount, contractId, method, args);
@@ -177,11 +192,14 @@ export class SorobanService {
     const { contractId, method, args, sourceSecretKey } = params;
     const keypair = StellarSdk.Keypair.fromSecret(sourceSecretKey);
     const sourcePublicKey = keypair.publicKey();
-    
+
     // Mark this user as having a pending transaction (read-your-writes)
     await markPendingTransaction(sourcePublicKey);
-    
-    let sourceAccount = await this.server.getAccount(keypair.publicKey());
+
+    let sourceAccount = validateSorobanAccount(
+      await this.server.getAccount(sourcePublicKey),
+      this.maxResponseBytes
+    );
     let tx = this.buildInvocation(sourceAccount, contractId, method, args);
 
     // Simulation-before-submission: this is what lets us reject a doomed
@@ -189,7 +207,10 @@ export class SorobanService {
     // SpendLimitExceeded) before ever paying network fees or waiting on
     // ledger close. sendTransaction is never reached below this point on a
     // failed simulation.
-    let sim = await this.server.simulateTransaction(tx);
+    let sim = validateSorobanSimulation(
+      await this.server.simulateTransaction(tx),
+      this.maxResponseBytes
+    );
     if (rpc.Api.isSimulationError(sim)) {
       // Transaction failed before submission - clear the pending flag
       await clearPendingTransaction(sourcePublicKey);
@@ -203,9 +224,15 @@ export class SorobanService {
     // rebuild and re-simulate against the restored state.
     if (rpc.Api.isSimulationRestore(sim)) {
       await this.submitRestore(keypair, sim.restorePreamble);
-      sourceAccount = await this.server.getAccount(keypair.publicKey());
+      sourceAccount = validateSorobanAccount(
+        await this.server.getAccount(sourcePublicKey),
+        this.maxResponseBytes
+      );
       tx = this.buildInvocation(sourceAccount, contractId, method, args);
-      sim = await this.server.simulateTransaction(tx);
+      sim = validateSorobanSimulation(
+        await this.server.simulateTransaction(tx),
+        this.maxResponseBytes
+      );
       if (rpc.Api.isSimulationError(sim)) {
         await clearPendingTransaction(sourcePublicKey);
         throw new SorobanSimulationError(
