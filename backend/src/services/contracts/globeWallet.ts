@@ -111,11 +111,12 @@ export function toSpendAllowance(assetCode: string, raw: RawSpendAllowance): Spe
   };
 }
 
-function requireContractId(): string {
-  if (!config.GLOBE_WALLET_CONTRACT_ID) {
+function requireContractId(override?: string): string {
+  const id = override ?? config.GLOBE_WALLET_CONTRACT_ID;
+  if (!id) {
     throw new SorobanNotConfiguredError();
   }
-  return config.GLOBE_WALLET_CONTRACT_ID;
+  return id;
 }
 
 /** Re-throws Soroban errors with contract-specific error codes translated to readable names. */
@@ -158,7 +159,14 @@ function withContractErrorCodes<T>(promise: Promise<T>): Promise<T> {
  * simulate/invoke/poll mechanics live in {@link SorobanService}.
  */
 export class GlobeWalletContract {
-  constructor(private readonly soroban: SorobanService) {}
+  constructor(
+    private readonly soroban: SorobanService,
+    private readonly contractIdOverride?: string
+  ) {}
+
+  private contractId(): string {
+    return requireContractId(this.contractIdOverride);
+  }
 
   private prepareWalletInvocation(params: {
     method: string;
@@ -168,7 +176,7 @@ export class GlobeWalletContract {
     return withWalletErrorTranslation(
       withContractErrorCodes(
         this.soroban.prepareInvocation({
-          contractId: requireContractId(),
+          contractId: this.contractId(),
           ...params,
         })
       )
@@ -180,7 +188,7 @@ export class GlobeWalletContract {
     user: string;
     asset: AssetInfo;
   }): Promise<string> {
-    const contractId = requireContractId();
+    const contractId = this.contractId();
     const { user, asset } = params;
     const currentAssets = await this.getAssets(user);
     if (currentAssets.some((current) => current.code.toLowerCase() === asset.code.toLowerCase())) {
@@ -218,7 +226,7 @@ export class GlobeWalletContract {
     user: string;
     assetCode: string;
   }): Promise<string> {
-    const contractId = requireContractId();
+    const contractId = this.contractId();
     const { user, assetCode } = params;
     const allowance = await this.getSpendAllowance(user, assetCode);
     if (!allowance.unlimited) {
@@ -240,7 +248,7 @@ export class GlobeWalletContract {
 
   /** Read-only: the caller's whitelisted assets. Free — simulated, never submitted. */
   async getAssets(userPublicKey: string): Promise<AssetInfo[]> {
-    const contractId = requireContractId();
+    const contractId = this.contractId();
     return withWalletErrorTranslation(
       this.soroban.simulate<AssetInfo[]>({
         contractId,
@@ -253,7 +261,7 @@ export class GlobeWalletContract {
 
   /** Read-only: the current guardian set (#51). Empty array when none are registered. */
   async getGuardians(): Promise<string[]> {
-    const contractId = requireContractId();
+    const contractId = this.contractId();
     const guardians = await withWalletErrorTranslation(
       this.soroban.simulate<string[] | null>({
         contractId,
@@ -267,7 +275,7 @@ export class GlobeWalletContract {
 
   /** Read-only: recovery threshold and timelock (#51). Null when recovery isn't configured. */
   async getRecoveryConfig(): Promise<RecoveryConfigView | null> {
-    const contractId = requireContractId();
+    const contractId = this.contractId();
     const raw = await withWalletErrorTranslation(
       this.soroban.simulate<RawRecoveryConfig | null | undefined>({
         contractId,
@@ -285,7 +293,7 @@ export class GlobeWalletContract {
    * timelock ETA (#51). Null when no recovery is in progress.
    */
   async getRecoveryProposal(config?: RecoveryConfigView | null): Promise<RecoveryProposalView | null> {
-    const contractId = requireContractId();
+    const contractId = this.contractId();
     const [raw, resolvedConfig] = await Promise.all([
       withWalletErrorTranslation(
         this.soroban.simulate<RawRecoveryProposal | null | undefined>({
@@ -330,7 +338,7 @@ export class GlobeWalletContract {
    * Window bounds come from the contract's own ledger-time calculation.
    */
   async getSpendAllowance(userPublicKey: string, assetCode: string): Promise<SpendAllowance> {
-    const contractId = requireContractId();
+    const contractId = this.contractId();
     const raw = await withWalletErrorTranslation(
       this.soroban.simulate<RawSpendAllowance>({
         contractId,
@@ -460,7 +468,7 @@ export class GlobeWalletContract {
     /** Amount in the asset's smallest unit (stroops), as a decimal string. */
     amount: string;
   }): Promise<ContractCallResult<null>> {
-    const contractId = requireContractId();
+    const contractId = this.contractId();
     const { userSecretKey, assetCode, amount } = params;
     const userPublicKey = StellarSdk.Keypair.fromSecret(userSecretKey).publicKey();
     return withWalletErrorTranslation(
@@ -515,7 +523,7 @@ export class GlobeWalletContract {
    * enforces the pause immediately.
    */
   async getContractStatus(): Promise<{ sendsPaused: boolean; pauser: string | null }> {
-    const contractId = requireContractId();
+    const contractId = this.contractId();
     const sourcePublicKey = readOnlySource();
     const [sendsPaused, pauser] = await Promise.all([
       withWalletErrorTranslation(
@@ -533,7 +541,7 @@ export class GlobeWalletContract {
    * Pending state is null-safe.
    */
   async getAdminState(callerPublicKey?: string): Promise<{ admin: string; pendingAdmin: string | null }> {
-    const contractId = requireContractId();
+    const contractId = this.contractId();
     const sourcePublicKey = callerPublicKey || StellarSdk.Keypair.random().publicKey();
 
     const admin = await withWalletErrorTranslation(
@@ -573,7 +581,7 @@ export class GlobeWalletContract {
     readyAtLedger: number;
     executableAt: string | null;
   } | null> {
-    const contractId = requireContractId();
+    const contractId = this.contractId();
     const sourcePublicKey = callerPublicKey || StellarSdk.Keypair.random().publicKey();
 
     try {
@@ -631,7 +639,7 @@ export class GlobeWalletContract {
     currentAdmin: string;
     candidate: string;
   }): Promise<string> {
-    const contractId = requireContractId();
+    const contractId = this.contractId();
     const { currentAdmin, candidate } = params;
     return this.soroban.buildUnsignedTransaction({
       contractId,
@@ -650,7 +658,7 @@ export class GlobeWalletContract {
   async buildAcceptAdminTx(params: {
     candidate: string;
   }): Promise<string> {
-    const contractId = requireContractId();
+    const contractId = this.contractId();
     const { candidate } = params;
     return this.soroban.buildUnsignedTransaction({
       contractId,
@@ -666,7 +674,7 @@ export class GlobeWalletContract {
   async buildCancelAdminTransferTx(params: {
     currentAdmin: string;
   }): Promise<string> {
-    const contractId = requireContractId();
+    const contractId = this.contractId();
     const { currentAdmin } = params;
     return this.soroban.buildUnsignedTransaction({
       contractId,

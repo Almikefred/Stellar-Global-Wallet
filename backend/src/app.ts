@@ -70,8 +70,23 @@ interface HealthDetails {
 const HEALTH_CHECK_TIMEOUT_MS = 1500;
 const HEALTH_CACHE_TTL_MS = 10_000;
 
+export interface HealthCheckDeps {
+  horizonUrl?: string;
+  sorobanRpcUrl?: string;
+  redisUrl?: string;
+  lockBackend?: "in-process" | "redis";
+  checkPostgres?: () => Promise<void>;
+  timeoutMs?: number;
+}
+
+export interface CreateAppOptions {
+  disableHealthCache?: boolean;
+  healthCheckDeps?: HealthCheckDeps;
+}
+
 async function timedCheck(
-  fn: (signal: AbortSignal) => Promise<unknown>
+  fn: (signal: AbortSignal) => Promise<unknown>,
+  timeoutMs: number = HEALTH_CHECK_TIMEOUT_MS
 ): Promise<DependencyCheck> {
   const controller = new AbortController();
   // The abort signal only stops fetch-based checks; pg and redis ignore it,
@@ -83,7 +98,7 @@ async function timedCheck(
       const err = new Error("Health check timed out");
       err.name = "TimeoutError";
       reject(err);
-    }, HEALTH_CHECK_TIMEOUT_MS);
+    }, timeoutMs);
   });
   const start = Date.now();
   try {
@@ -104,16 +119,18 @@ function skippedCheck(): DependencyCheck {
   return { ok: true, latencyMs: 0, skipped: true };
 }
 
-async function checkHorizon(signal: AbortSignal): Promise<DependencyCheck> {
+async function checkHorizon(deps: HealthCheckDeps = {}): Promise<DependencyCheck> {
+  const url = deps.horizonUrl ?? config.HORIZON_URL;
   return timedCheck(async (s) => {
-    const res = await fetch(config.HORIZON_URL, { signal: s });
+    const res = await fetch(url, { signal: s });
     if (!res.ok) throw new Error(`Horizon responded ${res.status}`);
-  });
+  }, deps.timeoutMs);
 }
 
-async function checkRpc(signal: AbortSignal): Promise<DependencyCheck> {
+async function checkRpc(deps: HealthCheckDeps = {}): Promise<DependencyCheck> {
+  const url = deps.sorobanRpcUrl ?? config.SOROBAN_RPC_URL;
   return timedCheck(async (s) => {
-    const res = await fetch(config.SOROBAN_RPC_URL, {
+    const res = await fetch(url, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "getHealth" }),
@@ -124,39 +141,51 @@ async function checkRpc(signal: AbortSignal): Promise<DependencyCheck> {
     if (body.result?.status && body.result.status !== "healthy") {
       throw new Error(`RPC status ${body.result.status}`);
     }
-  });
+  }, deps.timeoutMs);
 }
 
-async function checkPostgres(): Promise<DependencyCheck> {
+async function checkPostgres(deps: HealthCheckDeps = {}): Promise<DependencyCheck> {
   // Postgres backs the audit log, idempotency keys, sessions and device
   // tokens regardless of LOCK_BACKEND, so it is always checked.
   return timedCheck(async () => {
+    if (deps.checkPostgres) {
+      await deps.checkPostgres();
+      return;
+    }
     const { pool } = await import("./db");
     await pool.query("SELECT 1");
-  });
+  }, deps.timeoutMs);
 }
 
-async function checkRedis(): Promise<DependencyCheck> {
+async function checkRedis(deps: HealthCheckDeps = {}): Promise<DependencyCheck> {
   // Redis is only required when the lock backend is redis.
-  if (config.LOCK_BACKEND !== "redis") return skippedCheck();
+  const lockBackend = deps.lockBackend ?? config.LOCK_BACKEND;
+  if (lockBackend !== "redis") return skippedCheck();
+  const url = deps.redisUrl ?? config.REDIS_URL;
   return timedCheck(async () => {
     const { createClient } = await import("redis");
-    const client = createClient({ url: config.REDIS_URL });
+    const client = createClient({
+      url,
+      socket: { reconnectStrategy: false },
+    });
+    client.on("error", () => undefined);
     try {
       await client.connect();
       await client.ping();
     } finally {
-      await client.quit().catch(() => undefined);
+      await client.quit().catch(() => {
+        client.disconnect().catch(() => undefined);
+      });
     }
-  });
+  }, deps.timeoutMs);
 }
 
-async function runHealthChecks(): Promise<HealthDetails> {
+async function runHealthChecks(deps: HealthCheckDeps = {}): Promise<HealthDetails> {
   const [horizon, rpc, postgres, redis] = await Promise.all([
-    checkHorizon(new AbortController().signal),
-    checkRpc(new AbortController().signal),
-    checkPostgres(),
-    checkRedis(),
+    checkHorizon(deps),
+    checkRpc(deps),
+    checkPostgres(deps),
+    checkRedis(deps),
   ]);
 
   const checks = { horizon, rpc, postgres, redis };
@@ -176,7 +205,8 @@ async function runHealthChecks(): Promise<HealthDetails> {
 export function createApp(
   stellar: StellarService = new StellarService(),
   globeWallet: GlobeWalletContract = new GlobeWalletContract(new SorobanService()),
-  priceServices: { prices: PriceService; history: PriceHistoryService } = createDefaultPriceServices()
+  priceServices: { prices: PriceService; history: PriceHistoryService } = createDefaultPriceServices(),
+  options: CreateAppOptions = {}
 ) {
   const app = express();
 
@@ -402,8 +432,12 @@ export function createApp(
   app.get("/api/v1/health/details", async (_req, res, next) => {
     try {
       const now = Date.now();
-      if (!healthCache || now - healthCache.at > HEALTH_CACHE_TTL_MS) {
-        healthCache = { at: now, value: await runHealthChecks() };
+      if (
+        options.disableHealthCache ||
+        !healthCache ||
+        now - healthCache.at > HEALTH_CACHE_TTL_MS
+      ) {
+        healthCache = { at: now, value: await runHealthChecks(options.healthCheckDeps) };
       }
       res.status(healthCache.value.status === "down" ? 503 : 200).json(healthCache.value);
     } catch (err) {
@@ -484,6 +518,8 @@ export function createApp(
   // Routes
   app.use("/api/v1/wallet", createWalletRouter(stellar));
   app.use("/api/v1/account", createAccountRouter(stellar));
+  // #60 — transaction detail lookup (and scoped per-account status feed)
+  app.use("/api/v1/transactions", createTransactionsRouter(stellar));
   // #63 — resolve G.../M.../federation (name*domain) addresses
   app.use("/api/v1/resolve", createResolveRouter());
   app.use("/api/v1/contract", createContractRouter(globeWallet));

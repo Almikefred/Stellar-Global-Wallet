@@ -186,6 +186,34 @@ export const metrics = {
   indexerCurrentLedger: register(
     new Gauge("activity_feed_indexer_current_ledger", "Activity feed indexer highest indexed ledger")
   ),
+  /** #124 — Push notification delivery attempts, by platform and outcome. */
+  pushAttempts: register(
+    new Counter("push_attempts_total", "Push notification attempts by platform and outcome")
+  ),
+  /** #124 — Push notification payload size in bytes. */
+  pushPayloadSizeBytes: register(
+    new Histogram("push_payload_size_bytes", "Push notification payload size in bytes", [
+      100, 250, 500, 1000, 2500, 5000, 10000, 20000,
+    ])
+  ),
+  /** #124 — Push notification latency in milliseconds. */
+  pushLatencyMs: register(
+    new Histogram("push_latency_ms", "Push notification latency in milliseconds", [
+      100, 250, 500, 1000, 2500, 5000, 10000, 30000,
+    ])
+  ),
+  /** #124 — Invalid push tokens pruned by platform. */
+  pushTokensPruned: register(
+    new Counter("push_tokens_pruned_total", "Invalid push tokens pruned by platform")
+  ),
+  /** #124 — Expired push tokens (no device_not_registered, just old) by platform. */
+  pushTokensExpired: register(
+    new Counter("push_tokens_expired_total", "Expired push tokens by platform")
+  ),
+  /** #124 — Rate limit rejects for push sending. */
+  pushRateLimited: register(
+    new Counter("push_rate_limited_total", "Push notifications rejected due to rate limiting")
+  ),
 };
 
 export function renderMetrics(): string {

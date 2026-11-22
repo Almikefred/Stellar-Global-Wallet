@@ -99,9 +99,11 @@ export function findVerifiedAsset(code: string, issuer: string): VerifiedAsset |
 
 export class VerifiedAssetRegistry {
   private readonly keys: ReadonlySet<string>;
+  private readonly curated: readonly CuratedAsset[];
 
   constructor(curated: CuratedAsset[], extraKeys: ReadonlySet<string>) {
     this.keys = new Set([...curated.map((a) => assetKey(a.code, a.issuer)), ...extraKeys]);
+    this.curated = curated;
   }
 
   isVerified(code: string, issuer: string): boolean {
@@ -112,6 +114,11 @@ export class VerifiedAssetRegistry {
   issuersForCode(code: string): string[] {
     const prefix = `${code}:`;
     return [...this.keys].filter((k) => k.startsWith(prefix)).map((k) => k.slice(prefix.length));
+  }
+
+  /** All verified assets (for risk assessment). */
+  get verifiedAssets(): readonly CuratedAsset[] {
+    return this.curated;
   }
 }
 

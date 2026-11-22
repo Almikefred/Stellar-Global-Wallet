@@ -1,5 +1,5 @@
 import * as StellarSdk from "@stellar/stellar-sdk";
-import { AppError, NotFoundError, ValidationError } from "../errors/appError";
+import { AppError, HorizonError, NotFoundError, ValidationError } from "../errors/appError";
 import { config } from "../config";
 import { validatePathAssets } from "../validation/stellarAsset";
 import { AccountLock, InProcessAccountLock } from "./locks/accountLock";
@@ -165,6 +165,11 @@ const RETRY_BASE_DELAY_MS = 200;
 /** Path payment result codes that mean "the quote no longer holds" rather than a deterministic failure. */
 const PATH_EXPIRED_OPERATION_CODES = ["op_too_few_offers", "op_under_dest_min", "op_over_source_max"];
 
+export interface StellarServiceOptions {
+  horizonUrl?: string;
+  networkPassphrase?: string;
+}
+
 export class StellarService {
   private server: StellarSdk.Horizon.Server;
   private networkPassphrase: string;
@@ -180,17 +185,13 @@ export class StellarService {
   constructor(
     accountLock: AccountLock = new InProcessAccountLock(),
     builtTxs: BuiltTransactionRegistry | null = null,
-    options?: { maxResponseBytes?: number }
+    options: StellarServiceOptions = {}
   ) {
-    this.networkPassphrase = config.NETWORK_PASSPHRASE;
-    this.maxResponseBytes =
-      options?.maxResponseBytes ?? config.HORIZON_MAX_RESPONSE_BYTES;
-    this.server = new StellarSdk.Horizon.Server(config.HORIZON_URL);
-    installUpstreamHttpGuards(
-      "horizon",
-      (this.server as unknown as { httpClient?: unknown }).httpClient,
-      this.maxResponseBytes
-    );
+    const horizonUrl = options.horizonUrl ?? config.HORIZON_URL;
+    this.networkPassphrase = options.networkPassphrase ?? config.NETWORK_PASSPHRASE;
+    this.server = new StellarSdk.Horizon.Server(horizonUrl, {
+      allowHttp: horizonUrl.startsWith("http://"),
+    });
     this.accountLock = accountLock;
     this.builtTxs = builtTxs;
   }
@@ -214,7 +215,7 @@ export class StellarService {
       if (hasResponseStatus(err, 404)) {
         throw new NotFoundError(`Account ${publicKey} was not found on Horizon`, "ACCOUNT_NOT_FOUND");
       }
-      throw err;
+      throw translateHorizonTransportError(err);
     }
   }
 
@@ -227,7 +228,7 @@ export class StellarService {
       );
     } catch (err) {
       if (hasResponseStatus(err, 404)) return null;
-      throw err;
+      throw translateHorizonTransportError(err);
     }
   }
 
@@ -1797,14 +1798,28 @@ function isTxBadSeq(err: unknown): boolean {
 }
 
 function hasResponseStatus(err: unknown, status: number): boolean {
-  const response = err as { response?: { status?: number } } | undefined;
-  return response?.response?.status === status;
+  const candidate = err as
+    | {
+        response?: { status?: number };
+        cause?: { response?: { status?: number } };
+      }
+    | undefined;
+  return candidate?.response?.status === status || candidate?.cause?.response?.status === status;
 }
 
 function translateSubmissionError(err: unknown, sourcePublicKey: string): unknown {
   if (err instanceof StellarSdk.BadResponseError) {
-    const resultCodes = (err.response as { extras?: { result_codes?: unknown } } | undefined)
-      ?.extras?.result_codes as { transaction?: string; operations?: string[] } | undefined;
+    const responseObj = err.response as
+      | {
+          status?: number;
+          data?: { extras?: { result_codes?: unknown } };
+          extras?: { result_codes?: unknown };
+        }
+      | undefined;
+    const resultCodes = (responseObj?.extras?.result_codes ??
+      responseObj?.data?.extras?.result_codes) as
+      | { transaction?: string; operations?: string[] }
+      | undefined;
 
     if (resultCodes?.transaction === "tx_bad_seq") {
       return new SequenceConflictError(
@@ -1818,6 +1833,12 @@ function translateSubmissionError(err: unknown, sourcePublicKey: string): unknow
       );
     }
 
+    // Upstream 5xx from Horizon (502/503/504) without transaction result codes
+    // is a transient transport/gateway failure, not a deterministic client error (#234).
+    if (!resultCodes && isHorizonTransportFailure(err)) {
+      return translateHorizonTransportError(err);
+    }
+
     // Classify non-retryable Horizon errors so the caller knows the error
     // is deterministic and retrying won't help.
     const message = (err as Error).message ?? "Horizon submission failed";
@@ -1825,6 +1846,79 @@ function translateSubmissionError(err: unknown, sourcePublicKey: string): unknow
       `Horizon rejected the transaction for account ${sourcePublicKey}: ${message}`,
       resultCodes
     );
+  }
+  return translateHorizonTransportError(err);
+}
+
+const TRANSPORT_ERROR_CODES = new Set([
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "ETIMEDOUT",
+  "EPIPE",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "UND_ERR_SOCKET",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_BODY_TIMEOUT",
+  "ERR_SOCKET_CLOSED",
+  "ECONNABORTED",
+]);
+
+function isHorizonTransportFailure(err: unknown): boolean {
+  if (err instanceof AppError) return false;
+  const candidate = err as {
+    code?: unknown;
+    name?: unknown;
+    message?: unknown;
+    cause?: { code?: unknown; message?: unknown; response?: { status?: unknown } };
+    response?: { status?: unknown };
+  };
+  const status = candidate?.response?.status ?? candidate?.cause?.response?.status;
+  // Explicit 4xx HTTP responses from Horizon are client/ledger errors, never transport outages.
+  if (typeof status === "number" && status >= 400 && status < 500) {
+    return false;
+  }
+  if (typeof status === "number" && (status === 502 || status === 503 || status === 504)) {
+    return true;
+  }
+  if (err instanceof StellarSdk.NetworkError && !(err instanceof StellarSdk.BadResponseError)) {
+    return true;
+  }
+  if (typeof candidate?.code === "string" && TRANSPORT_ERROR_CODES.has(candidate.code)) {
+    return true;
+  }
+  if (typeof candidate?.cause?.code === "string" && TRANSPORT_ERROR_CODES.has(candidate.cause.code)) {
+    return true;
+  }
+  if (candidate?.name === "AbortError" || candidate?.name === "TimeoutError") {
+    return true;
+  }
+  if (
+    typeof candidate?.message === "string" &&
+    /(fetch failed|socket hang up|econnrefused|econnreset|etimedout|network error|timeout of \d+ms exceeded)/i.test(
+      candidate.message
+    )
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Translates low-level Horizon network / 5xx transport failures into a
+ * retryable `HORIZON_UNAVAILABLE` (502) AppError without leaking internal
+ * hostnames, ports, or stack traces (#234).
+ */
+function translateHorizonTransportError(err: unknown): unknown {
+  if (isHorizonTransportFailure(err)) {
+    return new HorizonError("The Stellar network is temporarily unavailable. Please retry shortly.", {
+      code: "HORIZON_UNAVAILABLE",
+      status: 502,
+      retryable: true,
+    });
   }
   return err;
 }

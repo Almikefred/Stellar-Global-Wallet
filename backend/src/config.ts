@@ -219,6 +219,10 @@ const envSchema = z.object({
   // docs/transaction-history.md). Rates move slowly, so cache for an hour.
   FX_API_URL: z.string().url().default("https://open.er-api.com/v6/latest/USD"),
   FX_CACHE_TTL_MS: z.coerce.number().int().positive().default(60 * 60 * 1000),
+  // Comma-separated list of currencies to snapshot for historical conversions.
+  // Used for tax reporting and historical value tracking. Only supported
+  // currencies are stored (see SUPPORTED_CURRENCIES in fx.ts).
+  FX_SNAPSHOT_CURRENCIES: z.string().default("EUR,GBP,NGN,KES,GHS"),
   // Upper bound on operations examined per filtered history page (#58).
   HISTORY_SCAN_CAP: z.coerce.number().int().positive().max(10000).default(1000),
 
@@ -253,6 +257,11 @@ const envSchema = z.object({
     .enum(["true", "false"])
     .optional()
     .transform((v) => (v === undefined ? process.env.NODE_ENV !== "production" : v === "true")),
+
+  // #124 — Expo push token TTL. Tokens are pruned after this many seconds
+  // (default: 90 days). Expo tokens are time-limited; clients must re-register
+  // before expiry or they will stop receiving notifications.
+  EXPO_TOKEN_TTL_SECONDS: z.coerce.number().int().positive().default(90 * 24 * 60 * 60),
 });
 
 export const config = envSchema.parse(process.env);

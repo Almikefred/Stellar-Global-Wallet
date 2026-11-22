@@ -7,6 +7,7 @@ import { getUnifiedActivityFeed } from "../services/activityFeed";
 import { isGAddress, publicKeyMessage } from "../utils/stellarAddress";
 import { AppError } from "../errors/appError";
 import { jwtAuth } from "../middleware/jwtAuth";
+import { requireAccountMatch } from "../middleware/requireAccountMatch";
 import { isValidMuxedId } from "../utils/muxed";
 import { computeMultisigInfo, computeReserveBreakdown, spendableBalance } from "../services/accountInfo";
 import { MAX_EXPORT_RANGE_MS, streamTransactionCsv } from "../services/transactionExport";
@@ -187,6 +188,7 @@ export function createAccountRouter(stellar: StellarService): Router {
   accountRouter.get(
     "/:publicKey/transactions/export.csv",
     jwtAuth,
+    requireAccountMatch((req) => req.params.publicKey),
     param("publicKey").custom(isGAddress).withMessage(publicKeyMessage),
     query("from").optional().isISO8601({ strict: true }).withMessage("from must be an ISO-8601 date"),
     query("to").optional().isISO8601({ strict: true }).withMessage("to must be an ISO-8601 date"),

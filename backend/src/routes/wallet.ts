@@ -1,6 +1,7 @@
 import { Router, Request, Response, NextFunction } from "express";
 import { body, param } from "express-validator";
 import { config } from "../config";
+import { AppError } from "../errors/appError";
 import { jwtAuth } from "../middleware/jwtAuth";
 import { requireAccountMatch } from "../middleware/requireAccountMatch";
 import { isValidMuxedId } from "../utils/muxed";
@@ -24,6 +25,7 @@ import {
   memoTextMessage,
 } from "@globe-wallet/sdk";
 import * as StellarSdk from "@stellar/stellar-sdk";
+import { withAccountContext } from "../db";
 import {
   claimIdempotencyKey,
   commitIdempotencyResult,
@@ -123,31 +125,34 @@ async function handleIdempotentRequest(
       // Bind the key to the request body so the same key cannot be reused
       // for a different payload (#198 — request fingerprint).
       fingerprint = requestFingerprint(req.body);
+      const ownerKey = sourcePublicKey;
+      const fp = fingerprint;
 
-      const claim = await claimIdempotencyKey(sourcePublicKey, idempotencyKey, fingerprint);
+      const claim = await withAccountContext(ownerKey, (tx) =>
+        claimIdempotencyKey(ownerKey, idempotencyKey, fp, tx)
+      );
 
       if (claim.status === "hit") {
         res.json({ hash: claim.result.hash, successful: claim.result.successful });
         return;
       }
       if (claim.status === "conflict") {
-        res.status(422).json({
-          error: {
-            code: "IDEMPOTENCY_KEY_REUSED",
-            message:
-              "This idempotency key was already used for a different request body. Use a new key.",
-          },
-        });
+        next(
+          new AppError(
+            "This idempotency key was already used for a different request body. Use a new key.",
+            { code: "IDEMPOTENCY_KEY_REUSED", status: 422, retryable: false }
+          )
+        );
         return;
       }
       if (claim.status === "in-flight") {
-        res.status(409).json({
-          error: {
+        next(
+          new AppError("This request is still being processed. Retry in a moment.", {
             code: "IDEMPOTENCY_KEY_IN_FLIGHT",
-            message: "This request is still being processed. Retry in a moment.",
+            status: 409,
             retryable: true,
-          },
-        });
+          })
+        );
         return;
       }
       // claim.status === "claimed" — fall through to execute.
@@ -159,18 +164,26 @@ async function handleIdempotentRequest(
     } catch (execErr) {
       // Release the sentinel so the client can retry with the same key.
       if (sourcePublicKey && idempotencyKey) {
-        await releaseIdempotencyKey(sourcePublicKey, idempotencyKey);
+        const ownerKey = sourcePublicKey;
+        await withAccountContext(ownerKey, (tx) =>
+          releaseIdempotencyKey(ownerKey, idempotencyKey, tx)
+        );
       }
       throw execErr;
     }
 
     if (sourcePublicKey && idempotencyKey && fingerprint) {
-      await commitIdempotencyResult(
-        sourcePublicKey,
-        idempotencyKey,
-        fingerprint,
-        result.hash,
-        result.successful
+      const ownerKey = sourcePublicKey;
+      const fp = fingerprint;
+      await withAccountContext(ownerKey, (tx) =>
+        commitIdempotencyResult(
+          ownerKey,
+          idempotencyKey,
+          fp,
+          result.hash,
+          result.successful,
+          tx
+        )
       );
     }
 
@@ -201,6 +214,10 @@ export function createWalletRouter(stellar: StellarService): Router {
   walletRouter.use(jwtAuth);
   // #33 — a token for account A cannot act for account B.
   walletRouter.use(requireAccountMatch());
+
+  // Non-custodial client-side signing routes (/send/build, /path-payment-*/build, /submit).
+  // Mounted after jwtAuth + requireAccountMatch so every route inherits account scoping.
+  walletRouter.use(createClientSigningRouter(stellar));
 
   // #9 — build unsigned XDR for adding or removing a classic Stellar trustline.
   walletRouter.post(
@@ -474,6 +491,7 @@ export function createWalletRouter(stellar: StellarService): Router {
   // and custodial services use muxed accounts to tag deposits to a sub-account.
   walletRouter.post(
     "/:publicKey/muxed",
+    requireAccountMatch((req) => req.params.publicKey),
     param("publicKey")
       .isLength({ min: 56, max: 56 })
       .bail()
@@ -723,6 +741,7 @@ export function createWalletRouter(stellar: StellarService): Router {
 
   walletRouter.get(
     "/:publicKey/thresholds",
+    requireAccountMatch((req) => req.params.publicKey),
     param("publicKey").custom(isGAddress).withMessage(publicKeyMessage),
     async (req, res, next) => {
       try {
