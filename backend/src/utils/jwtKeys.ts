@@ -164,8 +164,22 @@ export async function rotatePrimaryKey(): Promise<void> {
   currentKey = { ...kp, createdAt: new Date() };
 }
 
+/**
+ * Lazily ensures an ephemeral in-memory keypair exists when running under
+ * automated tests (NODE_ENV=test / Jest) without booting `index.ts:main()`.
+ * Production and development always fail closed until `initKeys()` runs.
+ */
+function ensureTestKeyIfApplicable(): void {
+  if (currentKey) return;
+  if (process.env.NODE_ENV === "test" || process.env.JEST_WORKER_ID !== undefined) {
+    const kp = generateRsaKeyPair();
+    currentKey = { ...kp, createdAt: new Date() };
+  }
+}
+
 /** Returns the active signing key (used by generateAccessToken). */
 export function getCurrentKey(): SigningKey {
+  ensureTestKeyIfApplicable();
   if (!currentKey) throw new Error("JWT keys not initialised; call initKeys() first");
   return currentKey;
 }
@@ -175,6 +189,7 @@ export function getCurrentKey(): SigningKey {
  * Returns null for unknown kids (token signed by a retired key).
  */
 export function findKeyByKid(kid: string): SigningKey | null {
+  ensureTestKeyIfApplicable();
   if (currentKey?.kid === kid) return currentKey;
   if (previousKey?.kid === kid) return previousKey;
   return null;
@@ -198,6 +213,7 @@ interface JwkPublicKey {
  * currently-valid signing keys. Safe to publish at /.well-known/jwks.json.
  */
 export function getJwks(): { keys: JwkPublicKey[] } {
+  ensureTestKeyIfApplicable();
   const keys: JwkPublicKey[] = [];
   for (const key of [currentKey, previousKey]) {
     if (!key) continue;

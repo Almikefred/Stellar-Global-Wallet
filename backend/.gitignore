@@ -5,4 +5,5 @@ dist/
 .env.production
 *.log
 coverage/
+artifacts/
 .DS_Store

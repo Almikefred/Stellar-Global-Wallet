@@ -66,7 +66,14 @@ async function main() {
   });
 
   // #79 — activity feed indexer for contract events
-  const stopActivityFeedIndexer = startActivityFeedIndexer(stellar);
+  let stopActivityFeedIndexer: () => void = () => {};
+  void startActivityFeedIndexer(stellar)
+    .then((stop) => {
+      stopActivityFeedIndexer = stop;
+    })
+    .catch((err: Error) => {
+      console.error("[activity-feed] failed to start indexer", err.message);
+    });
 
   // #185 — keep active wallets' persistent entries from archiving.
   const stopTtlKeeper = startTtlKeeper();

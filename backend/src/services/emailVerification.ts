@@ -27,10 +27,12 @@
  */
 
 import crypto from "crypto";
-import { pool, Queryable } from "../db";
+import { Pool } from "pg";
+import { StrKey } from "@stellar/stellar-sdk";
+import { pool } from "../db";
 import { getEmailProvider } from "./emailNotifier";
 import { tNotification } from "./i18nHelper";
-import { AppError } from "../errors/appError";
+import { AccountMismatchError, AppError } from "../errors/appError";
 
 const TOKEN_TTL_HOURS = 24;
 const BASE_URL = process.env.BASE_URL ?? "https://app.globewallet.app";
@@ -139,7 +141,11 @@ export async function sendVerificationEmail(
  * Confirms a verification token. Marks the email as verified on success.
  * Throws EmailTokenInvalidError or EmailTokenExpiredError on failure.
  */
-export async function verifyToken(token: string, db: Queryable = pool): Promise<{ account: string; email: string }> {
+export async function verifyToken(
+  token: string,
+  db: Pool = pool,
+  expectedAccount?: string
+): Promise<{ account: string; email: string }> {
   const { rows } = await db.query<{
     account: string;
     email: string;
@@ -157,6 +163,19 @@ export async function verifyToken(token: string, db: Queryable = pool): Promise<
   }
 
   const row = rows[0];
+
+  // #233 — Prevent cross-account token verification / email disclosure when
+  // an authenticated user submits another account's verification token.
+  if (
+    expectedAccount &&
+    StrKey.isValidEd25519PublicKey(expectedAccount) &&
+    row.account !== expectedAccount
+  ) {
+    throw new AccountMismatchError(undefined, {
+      authenticated: expectedAccount,
+      requested: row.account,
+    });
+  }
 
   if (new Date() > row.token_expires_at) {
     throw new EmailTokenExpiredError();

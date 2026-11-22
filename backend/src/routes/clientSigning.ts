@@ -1,10 +1,20 @@
 import { Router } from "express";
 import { body, header } from "express-validator";
+import { AppError } from "../errors/appError";
 import { jwtAuth } from "../middleware/jwtAuth";
+import { assertSignedXdrAccountMatch, requireAccountMatch } from "../middleware/requireAccountMatch";
 import { assertValidRequest, rejectUnknownBodyFields } from "../middleware/requestValidation";
-import { cacheResult, getCachedResult } from "../services/idempotency";
+import {
+  cacheResult,
+  claimIdempotencyKey,
+  commitIdempotencyResult,
+  getCachedResult,
+  releaseIdempotencyKey,
+  requestFingerprint,
+} from "../services/idempotency";
 import { StellarService } from "../services/stellar";
 import { shutdownManager } from "../services/shutdown";
+import { baseAccountId } from "../services/transactionEnvelope";
 import { publicKeyMessage } from "../utils/stellarAddress";
 import {
   assetParamMessage,
@@ -38,6 +48,7 @@ export function createClientSigningRouter(stellar: StellarService): Router {
   router.post(
     "/send/build",
     jwtAuth,
+    requireAccountMatch(),
     rejectUnknownBodyFields(["sourcePublicKey", "destinationPublicKey", "amount", "asset", "memo"]),
     body("sourcePublicKey").custom(isValidAccountId).withMessage(publicKeyMessage),
     body("destinationPublicKey").custom(isValidDestination).withMessage(destinationOrMuxedMessage),
@@ -89,6 +100,7 @@ export function createClientSigningRouter(stellar: StellarService): Router {
   router.post(
     "/path-payment-strict-send/build",
     jwtAuth,
+    requireAccountMatch(),
     rejectUnknownBodyFields([...pathPaymentFields, "sendAmount", "quotedDestAmount"]),
     ...pathPaymentValidation,
     body("sendAmount").custom(isValidStellarAmount).withMessage(amountMessage),
@@ -107,6 +119,7 @@ export function createClientSigningRouter(stellar: StellarService): Router {
   router.post(
     "/path-payment-strict-receive/build",
     jwtAuth,
+    requireAccountMatch(),
     rejectUnknownBodyFields([...pathPaymentFields, "destAmount", "quotedSendAmount"]),
     ...pathPaymentValidation,
     body("destAmount").custom(isValidStellarAmount).withMessage(amountMessage),
@@ -138,25 +151,87 @@ export function createClientSigningRouter(stellar: StellarService): Router {
         const { signedXdr } = req.body;
         const idempotencyKey: string | undefined = req.header("Idempotency-Key") ?? req.body.idempotencyKey;
 
-        const { sourcePublicKey } = stellar.parseSignedTransaction(signedXdr);
+        const parsed = stellar.parseSignedTransaction(signedXdr);
+        const { sourcePublicKey } = parsed;
+        const feeSource =
+          "innerTransaction" in parsed.transaction
+            ? baseAccountId(parsed.transaction.feeSource)
+            : undefined;
+        // #233 — enforce account scoping on the signed envelope's source (or fee source).
+        assertSignedXdrAccountMatch(req.user?.sub, sourcePublicKey, feeSource);
+
+        // #198 / #234 — use atomic claim/commit/release when available to eliminate
+        // concurrent duplicate submissions under network latency or retries.
+        const useAtomicClaim =
+          typeof claimIdempotencyKey === "function" && typeof requestFingerprint === "function";
+        const fingerprint =
+          idempotencyKey && useAtomicClaim ? requestFingerprint({ signedXdr }) : undefined;
+
         if (idempotencyKey) {
-          const cached = await getCachedResult(sourcePublicKey, idempotencyKey);
-          if (cached) {
-            res.json({ hash: cached.hash, successful: cached.successful });
-            return;
+          if (useAtomicClaim && fingerprint) {
+            const claim = await claimIdempotencyKey(sourcePublicKey, idempotencyKey, fingerprint);
+            if (claim.status === "hit") {
+              res.json({ hash: claim.result.hash, successful: claim.result.successful });
+              return;
+            }
+            if (claim.status === "conflict") {
+              next(
+                new AppError(
+                  "This idempotency key was already used for a different request body. Use a new key.",
+                  { code: "IDEMPOTENCY_KEY_REUSED", status: 422, retryable: false }
+                )
+              );
+              return;
+            }
+            if (claim.status === "in-flight") {
+              next(
+                new AppError("This request is still being processed. Retry in a moment.", {
+                  code: "IDEMPOTENCY_KEY_IN_FLIGHT",
+                  status: 409,
+                  retryable: true,
+                })
+              );
+              return;
+            }
+          } else {
+            const cached = await getCachedResult(sourcePublicKey, idempotencyKey);
+            if (cached) {
+              res.json({ hash: cached.hash, successful: cached.successful });
+              return;
+            }
           }
         }
 
-        const result = await shutdownManager.trackSubmission(() =>
-          stellar.submitSigned({ signedXdr })
-        );
+        let result;
+        try {
+          result = await shutdownManager.trackSubmission(() =>
+            stellar.submitSigned({ signedXdr })
+          );
+        } catch (execErr) {
+          if (idempotencyKey && useAtomicClaim && typeof releaseIdempotencyKey === "function") {
+            await releaseIdempotencyKey(sourcePublicKey, idempotencyKey).catch(() => undefined);
+          }
+          throw execErr;
+        }
+
         if ("status" in result) {
-          // Horizon timed out; the transaction may still land.
+          // Horizon timed out; the transaction may still land. Keep the in-flight
+          // claim (do not release) so concurrent retries do not duplicate.
           res.status(202).json(result);
           return;
         }
         if (idempotencyKey) {
-          await cacheResult(sourcePublicKey, idempotencyKey, result.hash, result.successful);
+          if (useAtomicClaim && fingerprint && typeof commitIdempotencyResult === "function") {
+            await commitIdempotencyResult(
+              sourcePublicKey,
+              idempotencyKey,
+              fingerprint,
+              result.hash,
+              result.successful
+            );
+          } else {
+            await cacheResult(sourcePublicKey, idempotencyKey, result.hash, result.successful);
+          }
         }
         res.json(result);
       } catch (err) {

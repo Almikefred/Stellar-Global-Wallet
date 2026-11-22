@@ -16,3 +16,4 @@ dist/
 # Local change-summary files (not for version control)
 CHANGES-*.md
 CHANGES.md
+changes.md

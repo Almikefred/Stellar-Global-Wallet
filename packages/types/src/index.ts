@@ -99,6 +99,25 @@ export interface SpendAllowance {
   nextRefillAt: string | null;
 }
 
+/**
+ * Risk assessment for an asset search result.
+ *
+ * "Verified" means the deployment vouches that CODE:ISSUER is the asset
+ * users almost certainly mean when they type CODE — e.g. Circle's USDC
+ * rather than one of the many lookalike USDC issuers on the network.
+ * It is not a statement about the asset's value or safety.
+ */
+export type RiskLevel = "low" | "medium" | "high" | "critical";
+
+/** Factors that contributed to the risk score. */
+export type RiskFactor =
+  | "unverified"
+  | "same_code_different_issuer"
+  | "homoglyph_domain"
+  | "low_holders"
+  | "very_new"
+  | "unknown_domain";
+
 /** One asset search hit for the add-trustline flow, issue #53. */
 export interface AssetSearchResult {
   code: string;
@@ -109,6 +128,10 @@ export interface AssetSearchResult {
   numAccounts: number | null;
   /** On the deployment's curated verified list. Verified results sort first. */
   verified: boolean;
+  /** Risk assessment (new in #123). */
+  riskLevel: RiskLevel;
+  /** Why the asset received its risk level (new in #123). */
+  riskFactors: RiskFactor[];
 }
 
 export interface AssetSearchPage {

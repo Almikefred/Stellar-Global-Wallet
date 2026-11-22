@@ -55,8 +55,7 @@ emailRouter.post(
     try {
       assertValidRequest(req);
       const { token } = req.body as { token: string };
-      const account = req.user!.sub;
-      const { email } = await withAccountContext(account, (tx) => verifyToken(token, tx));
+      const { email } = await verifyToken(token, undefined, req.user!.sub);
       res.json({ message: "Email verified successfully.", email });
     } catch (err) {
       next(err);

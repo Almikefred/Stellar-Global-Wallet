@@ -4,11 +4,16 @@ module.exports = {
   testEnvironment: "node",
   roots: ["<rootDir>/tests", "<rootDir>/src"],
   testMatch: ["**/*.test.ts"],
-  // tests/e2e/* hit real testnet (Horizon, Soroban RPC, Friendbot) and are
-  // gated by E2E_TESTNET=1 — see jest.e2e.config.js. Excluded here so the
-  // regular `npm test` run (unit + mocked integration tests) never makes a
-  // live network call or depends on testnet being reachable/funded.
-  testPathIgnorePatterns: ["/node_modules/", "<rootDir>/tests/e2e/"],
+  // tests/e2e/* hit real testnet or local quickstart (see jest.e2e*.config.js),
+  // and toxiproxyChaos.test.ts requires a live Toxiproxy compose stack (see
+  // jest.chaos.config.js). Excluded here so `npm test` stays fast and hermetic;
+  // tests/chaos/chaosResilience.test.ts and tests/integration/localE2eFlow.test.ts
+  // DO run as part of `npm test`.
+  testPathIgnorePatterns: [
+    "/node_modules/",
+    "<rootDir>/tests/e2e/",
+    "<rootDir>/tests/chaos/toxiproxyChaos.test.ts",
+  ],
   setupFiles: ["<rootDir>/tests/env.setup.ts", "<rootDir>/src/test-utils/setup.ts"],
   transform: {
     "^.+\\.tsx?$": ["ts-jest", { diagnostics: false }],

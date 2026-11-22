@@ -55,7 +55,9 @@ export const FALLBACK_FEES: NetworkFeesResponse = {
 };
 
 function horizonFeeStats(): FeeStatsFetcher {
-  const server = new Horizon.Server(config.HORIZON_URL);
+  const server = new Horizon.Server(config.HORIZON_URL, {
+    allowHttp: config.HORIZON_URL.startsWith("http://"),
+  });
   return () => server.feeStats();
 }
 

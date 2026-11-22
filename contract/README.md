@@ -74,7 +74,9 @@ address and both contracts' IDs. The script prints the exact
 `backend/.env` values to copy so the API can talk to the local deployment
 instead of testnet. The file is gitignored — it's a fresh deployment
 record every time the quickstart container restarts, not something to
-commit.
+commit. See [`backend/docs/e2e-local-testing.md`](../backend/docs/e2e-local-testing.md)
+for running the full hermetic contract + backend + SDK E2E suite (#232), and
+[`docs/threat-model.md`](../docs/threat-model.md) for the system-wide threat model (#238).
 
 ## Contract: `globe-wallet`
 
@@ -142,6 +144,16 @@ on behalf of users within a session allowance.
 > See **[docs/design/architecture.md](docs/design/architecture.md)** for how
 > globe-wallet and token-wrapper are intended to compose, the current state
 > of their interaction, and integration guidance.
+
+## Design proposals
+
+Designs for planned work. Each one describes the intended behaviour, API,
+errors, events and test plan before the implementation lands:
+
+- [Allowance expiry vs storage TTL](docs/design/allowance-expiry-and-ttl.md) (#244)
+- [Batched multi-send with atomic limits](docs/design/batched-send.md) (#245)
+- [Scheduled and recurring payments](docs/design/scheduled-payments.md) (#246)
+- [Version and feature introspection](docs/design/version-introspection.md) (#247)
 
 ## Events
 

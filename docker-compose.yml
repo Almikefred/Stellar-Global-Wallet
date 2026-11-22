@@ -74,5 +74,33 @@ services:
       timeout: 5s
       retries: 30
 
+  # Chaos fault-injection proxy (issue #234) — opt in with:
+  #   docker compose --profile local --profile chaos up -d postgres redis stellar toxiproxy
+  # Sits in front of Horizon (:18000), Soroban RPC (:18001), Postgres (:15432),
+  # and Redis (:16379) so tests can inject real TCP resets, latency, and network
+  # partitions via the Toxiproxy Admin API (:8474).
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    profiles: ["chaos"]
+    command: ["-host=0.0.0.0", "-config=/etc/toxiproxy/toxiproxy.json"]
+    ports:
+      - "8474:8474"
+      - "18000:18000"
+      - "18001:18001"
+      - "15432:15432"
+      - "16379:16379"
+    volumes:
+      - ./chaos/toxiproxy.json:/etc/toxiproxy/toxiproxy.json:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/toxiproxy-cli", "-h", "http://localhost:8474", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+
 volumes:
   postgres-data:

@@ -20,7 +20,8 @@
 import * as StellarSdk from "@stellar/stellar-sdk";
 import { pool } from "../db";
 import { config } from "../config";
-import { AppError } from "../errors/appError";
+import { AccountMismatchError, AppError } from "../errors/appError";
+import { baseAccountId } from "./transactionEnvelope";
 
 // ---------------------------------------------------------------------------
 // Policy constants (overridable via env — config.ts validates them).
@@ -173,6 +174,17 @@ export async function sponsorFeeBump(
 
   const innerTx = new StellarSdk.Transaction(transactionXdr, networkPassphrase);
 
+  // #233 — Ensure the signed inner transaction actually belongs to `innerAccount`,
+  // preventing an authenticated caller from passing their own `innerAccount` to
+  // sponsor a transaction for a different account.
+  const actualInnerSource = baseAccountId(innerTx.source);
+  if (actualInnerSource !== innerAccount) {
+    throw new AccountMismatchError(
+      "Inner transaction source account does not match innerAccount",
+      { requested: actualInnerSource, authenticated: innerAccount }
+    );
+  }
+
   // Check eligibility BEFORE submitting.
   const feeStroops = Number(StellarSdk.BASE_FEE) * Math.max(innerTx.operations.length, 1);
   const policy = await evaluatePolicy(innerAccount, feeStroops, innerTx);
@@ -184,7 +196,9 @@ export async function sponsorFeeBump(
   }
 
   // Check if the inner account is self-sufficient (has enough XLM).
-  const server = new StellarSdk.Horizon.Server(horizonUrl);
+  const server = new StellarSdk.Horizon.Server(horizonUrl, {
+    allowHttp: horizonUrl.startsWith("http://"),
+  });
   try {
     const account = await server.loadAccount(innerAccount);
     const native = account.balances.find((b) => b.asset_type === "native");
