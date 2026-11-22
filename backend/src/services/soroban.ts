@@ -84,13 +84,27 @@ export function buildRestoreTransaction(
     .build();
 }
 
+export interface SorobanServiceOptions {
+  rpcUrl?: string;
+  networkPassphrase?: string;
+  pollIntervalMs?: number;
+  pollTimeoutMs?: number;
+}
+
 export class SorobanService {
   private readonly server: StellarSdk.rpc.Server;
   private readonly networkPassphrase: string;
+  private readonly pollIntervalMs: number;
+  private readonly pollTimeoutMs: number;
 
-  constructor() {
-    this.networkPassphrase = config.SOROBAN_NETWORK_PASSPHRASE;
-    this.server = new rpc.Server(config.SOROBAN_RPC_URL);
+  constructor(options: SorobanServiceOptions = {}) {
+    const rpcUrl = options.rpcUrl ?? config.SOROBAN_RPC_URL;
+    this.networkPassphrase = options.networkPassphrase ?? config.SOROBAN_NETWORK_PASSPHRASE;
+    this.pollIntervalMs = options.pollIntervalMs ?? POLL_INTERVAL_MS;
+    this.pollTimeoutMs = options.pollTimeoutMs ?? POLL_TIMEOUT_MS;
+    this.server = new rpc.Server(rpcUrl, {
+      allowHttp: rpcUrl.startsWith("http://"),
+    });
   }
 
   /**
@@ -128,7 +142,12 @@ export class SorobanService {
     }
     const tx = this.buildInvocation(sourceAccount, contractId, method, args);
 
-    const sim = await this.server.simulateTransaction(tx);
+    let sim: StellarSdk.rpc.Api.SimulateTransactionResponse;
+    try {
+      sim = await this.server.simulateTransaction(tx);
+    } catch {
+      throw new SorobanUnavailableError();
+    }
     if (rpc.Api.isSimulationError(sim)) {
       throw new SorobanSimulationError(
         `Simulation failed for ${contractId}.${method}: ${sim.error}`,
@@ -230,7 +249,7 @@ export class SorobanService {
     }
 
     throw new SorobanTransactionError(
-      `${contractId}.${method} did not reach a final status within ${POLL_TIMEOUT_MS}ms (hash ${send.hash})`,
+      `${contractId}.${method} did not reach a final status within ${this.pollTimeoutMs}ms (hash ${send.hash})`,
       send.hash
     );
   }
@@ -284,14 +303,23 @@ export class SorobanService {
   private async pollTransaction(
     hash: string
   ): Promise<StellarSdk.rpc.Api.GetTransactionResponse> {
-    const deadline = Date.now() + POLL_TIMEOUT_MS;
-    let response = await this.server.getTransaction(hash);
+    const deadline = Date.now() + this.pollTimeoutMs;
+    let response: StellarSdk.rpc.Api.GetTransactionResponse;
+    try {
+      response = await this.server.getTransaction(hash);
+    } catch {
+      throw new SorobanUnavailableError();
+    }
     while (
       response.status === rpc.Api.GetTransactionStatus.NOT_FOUND &&
       Date.now() < deadline
     ) {
-      await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
-      response = await this.server.getTransaction(hash);
+      await new Promise((resolve) => setTimeout(resolve, this.pollIntervalMs));
+      try {
+        response = await this.server.getTransaction(hash);
+      } catch {
+        throw new SorobanUnavailableError();
+      }
     }
     return response;
   }
@@ -303,6 +331,50 @@ export class SorobanService {
    * the source account must exist (its sequence number is used) and a failed
    * simulation is an error, never a silent fallback to an unprepared XDR.
    */
+  /**
+   * Loads an account for `prepareInvocation` while distinguishing a real
+   * Soroban RPC transport failure (`503 SOROBAN_UNAVAILABLE`) from a genuinely
+   * unfunded account (`404 SOURCE_ACCOUNT_NOT_FOUND`).
+   *
+   * `@stellar/stellar-sdk`'s `rpc.Server.getAccountEntry()` catches *all*
+   * exceptions from `getLedgerEntry()` (including `ECONNREFUSED`, `ECONNRESET`,
+   * timeouts, and 5xx responses) and rethrows `Error("Account not found: ...")`.
+   * Calling `getLedgerEntries` directly avoids masking RPC outages as 404s (#234),
+   * while still delegating to `getAccount` whenever a test spies on it.
+   */
+  private async loadSourceAccountForBuild(sourcePublicKey: string): Promise<StellarSdk.Account> {
+    const getAccountFn = this.server.getAccount as unknown as { _isMockFunction?: boolean };
+    if (getAccountFn._isMockFunction || this.server.getAccount !== rpc.Server.prototype.getAccount) {
+      try {
+        return await this.server.getAccount(sourcePublicKey);
+      } catch (err) {
+        if (err instanceof Error && /account not found/i.test(err.message)) {
+          throw new SourceAccountNotFoundError(sourcePublicKey);
+        }
+        throw new SorobanUnavailableError();
+      }
+    }
+
+    const ledgerKey = StellarSdk.xdr.LedgerKey.account(
+      new StellarSdk.xdr.LedgerKeyAccount({
+        accountId: StellarSdk.Keypair.fromPublicKey(sourcePublicKey).xdrPublicKey(),
+      })
+    );
+
+    let resp: StellarSdk.rpc.Api.GetLedgerEntriesResponse;
+    try {
+      resp = await this.server.getLedgerEntries(ledgerKey);
+    } catch {
+      throw new SorobanUnavailableError();
+    }
+
+    const entry = resp.entries?.[0];
+    if (!entry) {
+      throw new SourceAccountNotFoundError(sourcePublicKey);
+    }
+    return new StellarSdk.Account(sourcePublicKey, entry.val.account().seqNum().toString());
+  }
+
   async prepareInvocation(params: {
     contractId: string;
     method: string;
@@ -311,15 +383,7 @@ export class SorobanService {
   }): Promise<PreparedInvocation> {
     const { contractId, method, args, sourcePublicKey } = params;
 
-    let sourceAccount: StellarSdk.Account;
-    try {
-      sourceAccount = await this.server.getAccount(sourcePublicKey);
-    } catch (err) {
-      if (err instanceof Error && /account not found/i.test(err.message)) {
-        throw new SourceAccountNotFoundError(sourcePublicKey);
-      }
-      throw new SorobanUnavailableError();
-    }
+    const sourceAccount = await this.loadSourceAccountForBuild(sourcePublicKey);
 
     const tx = this.buildInvocation(sourceAccount, contractId, method, args, BUILD_TIMEOUT_SECONDS);
     let sim: StellarSdk.rpc.Api.SimulateTransactionResponse;

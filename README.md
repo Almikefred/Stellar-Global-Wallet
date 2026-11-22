@@ -47,6 +47,8 @@ flowchart LR
 
 The UI is designed in the [Figma file template](https://claude.ai/artifact/HAEA9kUpEhSMCyjDwCBL6t#page-dcb81aee8d83). For a deep dive into structure, testnet status and the roadmap, see **[HACKMD.md](HACKMD.md)**. For which API URL, contract ID, or feature flags apply to local vs. testnet vs. mainnet, see **[backend/docs/environments.md](backend/docs/environments.md)**. Product analytics events and their privacy rules are defined in **[docs/specs/analytics.md](docs/specs/analytics.md)**. For how clients build, sign and submit transactions (Freighter, xBull, WalletConnect, local keystore), see **[backend/docs/client-signing.md](backend/docs/client-signing.md)**.
 
+Security & resilience docs: **[System threat model](docs/threat-model.md)** (#238) · **[Route authorization matrix](backend/docs/security/authz-matrix.md)** (#233) · **[Local quickstart E2E guide](backend/docs/e2e-local-testing.md)** (#232) · **[Chaos testing guide](backend/docs/chaos-testing.md)** (#234).
+
 Frontend behaviour specs live in [`docs/specs/`](docs/specs/): [spend limits](docs/specs/spend-limits.md).
 
 ## 🚀 Quick start
@@ -97,10 +99,12 @@ flowchart LR
 
 | Workflow | Runs when | Checks |
 |---|---|---|
-| `backend.yml` | `backend/` changes | Type-check, Jest tests |
+| `backend.yml` | `backend/` changes | Type-check, Jest tests (including authz matrix, hermetic E2E & chaos resilience suites) |
 | `contract.yml` | `contract/` changes | `cargo check`, `cargo test` |
 | `packages.yml` | `packages/*` changes | Lint, type-check, test, build each package |
 | `contract-bindings.yml` | `contract/contracts/globe-wallet/**` or `contract/contracts/token-wrapper/**` changes | Rebuilds the contract wasm, regenerates `packages/bindings/globe-wallet` and `packages/bindings/token-wrapper`, fails if stale, type-checks the SDK against them |
+| `e2e-local.yml` | Contract/backend/SDK changes & manual dispatch | Spins `stellar/quickstart`, deploys contracts via `deploy-local.sh`, runs hermetic contract + backend + SDK E2E suite, uploads redacted artifacts on failure (#232) |
+| `chaos-nightly.yml` | Nightly schedule & manual dispatch | Runs Toxiproxy fault-injection suite across Horizon, Soroban RPC, Postgres, and Redis (#234) |
 | `release.yml` | PRs and pushes to `main` | Dry-runs (PRs) or performs (`main`, via Changesets) the npm release of `packages/*` |
 
 ## ⚠️ Status

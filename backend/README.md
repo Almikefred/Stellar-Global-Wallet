@@ -66,12 +66,21 @@ walked through in [`docs/client-signing.md`](./docs/client-signing.md).
 ## Tests
 
 ```bash
-npm test
+npm test                  # unit, integration, authz matrix (#233), hermetic E2E & chaos resilience suites
+npm run test:e2e:local    # full local stellar/quickstart E2E suite (#232)
+npm run test:chaos        # live Toxiproxy fault-injection suite (#234)
 ```
 
 Route tests use [supertest](https://github.com/ladjs/supertest) and cover the
 happy path, validation failures and auth failures. Schema-conformance tests
 check responses against `openapi.yaml`.
+
+### Security, E2E, and chaos guides
+
+- [System threat model](../docs/threat-model.md) (#238)
+- [Route authorization matrix](docs/security/authz-matrix.md) (#233)
+- [Local quickstart E2E suite](docs/e2e-local-testing.md) (#232)
+- [Chaos testing with Toxiproxy](docs/chaos-testing.md) (#234)
 
 ## Client runtime configuration
 

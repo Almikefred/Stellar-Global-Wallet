@@ -1,0 +1,102 @@
+name: Chaos Suite Nightly (Toxiproxy)
+
+# Nightly chaos engineering job (#234): starts Postgres, Redis, local
+# stellar/quickstart, and Shopify Toxiproxy via docker-compose.yml and runs
+# real network fault-injection scenarios (latency, TCP resets, partitions)
+# asserting clean shared error envelopes, fail-closed locking, and zero
+# duplicate transaction submissions.
+
+on:
+  schedule:
+    # 04:00 UTC daily (staggered between E2E and SDK smoke jobs).
+    - cron: "0 4 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chaos-nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  chaos:
+    name: Chaos Tests (Horizon, RPC, Postgres, Redis)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Start Postgres, Redis, stellar/quickstart, and Toxiproxy
+        run: |
+          docker compose --profile local --profile chaos up -d postgres redis stellar toxiproxy
+          docker compose --profile local --profile chaos ps
+
+      - name: Wait for dependencies and Toxiproxy readiness
+        run: |
+          for i in $(seq 1 90); do
+            if curl -sf http://localhost:8474/version >/dev/null 2>&1 \
+              && curl -sf http://localhost:8000/ >/dev/null 2>&1 \
+              && curl -sf -X POST http://localhost:8000/soroban/rpc \
+                -H "Content-Type: application/json" \
+                -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | grep -q '"healthy"' \
+              && docker compose exec -T postgres pg_isready -U user -d globewallet >/dev/null 2>&1 \
+              && docker compose exec -T redis redis-cli ping | grep -q PONG; then
+              echo "All chaos dependencies and Toxiproxy are healthy."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Chaos dependencies did not become ready in time." >&2
+          exit 1
+
+      - name: Install workspace dependencies
+        run: npm ci
+
+      - name: Build workspace packages
+        run: npm run build:packages
+
+      - name: Run Toxiproxy chaos suite
+        env:
+          CHAOS_ENABLED: "1"
+          CHAOS_TOXIPROXY_URL: "http://localhost:8474"
+          CHAOS_HORIZON_URL: "http://localhost:18000"
+          CHAOS_SOROBAN_RPC_URL: "http://localhost:18001/soroban/rpc"
+          CHAOS_DATABASE_URL: "postgresql://user:password@localhost:15432/globewallet"
+          CHAOS_REDIS_URL: "redis://localhost:16379"
+          CHAOS_FRIENDBOT_URL: "http://localhost:8000/friendbot"
+          CHAOS_NETWORK_PASSPHRASE: "Standalone Network ; February 2017"
+          DATABASE_URL: "postgresql://user:password@localhost:15432/globewallet"
+          REDIS_URL: "redis://localhost:16379"
+        run: npm run test:chaos --workspace backend -- --verbose
+
+      - name: Collect failure artifacts
+        if: failure()
+        run: |
+          mkdir -p backend/artifacts/chaos
+          curl -sf http://localhost:8474/proxies > backend/artifacts/chaos/toxiproxy-proxies.json 2>&1 || true
+          docker compose --profile local --profile chaos logs --tail=250 toxiproxy > backend/artifacts/chaos/toxiproxy.log 2>&1 || true
+          docker compose --profile local --profile chaos logs --tail=250 stellar > backend/artifacts/chaos/stellar.log 2>&1 || true
+          docker compose --profile local --profile chaos logs --tail=200 postgres > backend/artifacts/chaos/postgres.log 2>&1 || true
+          docker compose --profile local --profile chaos logs --tail=200 redis > backend/artifacts/chaos/redis.log 2>&1 || true
+
+      - name: Upload chaos failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chaos-nightly-failure-artifacts
+          path: backend/artifacts/chaos/
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Tear down chaos containers
+        if: always()
+        run: docker compose --profile local --profile chaos down -v --remove-orphans || true

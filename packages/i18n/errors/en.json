@@ -51,6 +51,8 @@
   "PATH_EXPIRED": "The exchange rate changed. Get a new quote and try again.",
   "DESTINATION_NO_TRUSTLINE": "The recipient can't receive this asset yet.",
   "SEP7_INVALID_URI": "That payment link isn't valid.",
+  "IDEMPOTENCY_KEY_REUSED": "This idempotency key was already used for a different request.",
+  "IDEMPOTENCY_KEY_IN_FLIGHT": "This request is still being processed. Retry in a moment.",
   "HORIZON_ERROR": "The Stellar network returned an error. Please try again.",
   "HORIZON_UNAVAILABLE": "The Stellar network is temporarily unavailable. Please try again.",
   "HORIZON_TX_INSUFFICIENT_BALANCE": "You don't have enough funds for this.",
