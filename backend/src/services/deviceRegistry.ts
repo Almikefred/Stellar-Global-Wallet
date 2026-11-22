@@ -72,7 +72,7 @@ export function deviceFingerprint(token: string): string {
 }
 
 /** Lazily creates the devices table (called by ensureAuditTable in db.ts). */
-export async function ensureDevicesTable(db: Pool = pool): Promise<void> {
+export async function ensureDevicesTable(db: Queryable = pool): Promise<void> {
   await db.query(`
     CREATE TABLE IF NOT EXISTS devices (
       id           BIGSERIAL    PRIMARY KEY,
@@ -101,7 +101,7 @@ export async function upsertDevice(
   platform: Platform,
   token: string,
   locale: string,
-  db: Pool = pool
+  db: Queryable = pool
 ): Promise<Device> {
   const expiresAt =
     platform === "expo"
@@ -146,7 +146,7 @@ export async function upsertDevice(
 export async function deleteDevice(
   account: string,
   deviceId: string,
-  db: Pool = pool
+  db: Queryable = pool
 ): Promise<boolean> {
   const { rowCount } = await db.query(
     `DELETE FROM devices WHERE id = $1 AND account = $2`,
@@ -221,7 +221,7 @@ export async function getValidDevicesForAccount(
  */
 export async function getValidDevicesForAccounts(
   accounts: string[],
-  db: Pool = pool
+  db: Queryable = pool
 ): Promise<Device[]> {
   if (accounts.length === 0) return [];
   const placeholders = accounts.map((_, i) => `$${i + 1}`).join(",");

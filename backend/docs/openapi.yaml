@@ -49,56 +49,26 @@ info:
     such as `REFRESH_TOKEN_INVALID` and `ROUTE_NOT_FOUND` are not retryable and
     require the client to re-authenticate or correct the request.
 
-    ## Outbound webhooks (#279)
+    ## Encrypted key backup (#274)
 
-    Integrators can subscribe to wallet events via webhook endpoints. Every
-    delivery is signed with HMAC-SHA256 over the raw request body using the
-    endpoint's active secret. The signature is sent in the
-    `X-Webhook-Signature` header as `t=<unix>,v1=<hex>`; recompute
-    `HMAC_SHA256(secret, "<t>.<rawBody>")` and compare in constant time, and
-    reject timestamps older than 5 minutes to prevent replay.
-
-    Secrets can be rotated: after rotation the previous secret remains valid
-    for a grace window so integrators can roll over without dropping events.
-    Deliveries are retried with exponential backoff; events that exhaust
-    retries are moved to a dead-letter queue and can be replayed. Deliveries
-    are ordered per endpoint. Delivery targets are validated to block
-    private/internal addresses (SSRF-safe).
+    The backup endpoints store **only ciphertext**. The wallet secret is
+    encrypted on the client before upload; the server never sees the plaintext
+    secret, the wrapping key, or the passphrase. See
+    [`docs/key-backup.md`](./key-backup.md) for the client-side encryption spec,
+    recovery flow and threat model.
 servers:
   - url: http://localhost:4000
     description: Local development
 paths:
-  /api/v1/webhooks/endpoints:
-    get:
-      summary: List webhook endpoints
-      description: Returns the caller's webhook endpoints (secrets are never returned).
-      security:
-        - bearerAuth: []
-      parameters:
-        - $ref: "#/components/parameters/RequestId"
-      responses:
-        '200':
-          description: Webhook endpoints
-          headers:
-            X-Request-Id:
-              $ref: "#/components/headers/X-Request-Id"
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [endpoints]
-                properties:
-                  endpoints:
-                    type: array
-                    items: { $ref: "#/components/schemas/WebhookEndpoint" }
-        default:
-          $ref: "#/components/responses/Error"
+  /api/v1/backups:
     post:
-      summary: Create a webhook endpoint
+      summary: Upload an encrypted key backup blob
       description: >-
-        Registers a delivery URL and the events to subscribe to. The URL is
-        validated and must not resolve to a private/internal address
-        (SSRF-safe). The signing secret is returned once on creation.
+        Stores an opaque, client-encrypted backup blob for the authenticated
+        user. The server treats `ciphertext` as opaque bytes and never attempts
+        to decrypt it. Uploading replaces any existing blob for the user
+        (last-write-wins). Rate limited per user.
+      operationId: uploadKeyBackup
       security:
         - bearerAuth: []
       parameters:
@@ -108,140 +78,134 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/WebhookEndpointInput"
+              $ref: "#/components/schemas/KeyBackupUpload"
       responses:
-        '201':
-          description: Endpoint created
+        "201":
+          description: Backup stored.
           headers:
             X-Request-Id:
               $ref: "#/components/headers/X-Request-Id"
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/WebhookEndpointWithSecret"
-        default:
-          $ref: "#/components/responses/Error"
-  /api/v1/webhooks/endpoints/{id}:
-    parameters:
-      - name: id
-        in: path
-        required: true
-        schema:
-          type: string
-          format: uuid
-    delete:
-      summary: Delete a webhook endpoint
-      security:
-        - bearerAuth: []
-      parameters:
-        - $ref: "#/components/parameters/RequestId"
-      responses:
-        '204':
-          description: Endpoint deleted
-          headers:
-            X-Request-Id:
-              $ref: "#/components/headers/X-Request-Id"
-        default:
-          $ref: "#/components/responses/Error"
-  /api/v1/webhooks/endpoints/{id}/rotate-secret:
-    parameters:
-      - name: id
-        in: path
-        required: true
-        schema:
-          type: string
-          format: uuid
-    post:
-      summary: Rotate the signing secret
-      description: >-
-        Issues a new signing secret. The previous secret stays valid for a
-        grace window so in-flight deliveries can still be verified.
-      security:
-        - bearerAuth: []
-      parameters:
-        - $ref: "#/components/parameters/RequestId"
-      responses:
-        '200':
-          description: New secret
+                $ref: "#/components/schemas/KeyBackupMetadata"
+        "400":
+          description: >-
+            Invalid input (e.g. `BACKUP_INVALID_CIPHERTEXT`,
+            `BACKUP_INVALID_KDF_PARAMS`).
           headers:
             X-Request-Id:
               $ref: "#/components/headers/X-Request-Id"
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/WebhookEndpointWithSecret"
-        default:
-          $ref: "#/components/responses/Error"
-  /api/v1/webhooks/endpoints/{id}/deliveries:
-    parameters:
-      - name: id
-        in: path
-        required: true
-        schema:
-          type: string
-          format: uuid
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Missing or invalid bearer token.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "413":
+          description: Ciphertext exceeds the maximum allowed size (`BACKUP_TOO_LARGE`).
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          description: Rate limit exceeded (`BACKUP_RATE_LIMITED`).
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
     get:
-      summary: List delivery logs for an endpoint
+      summary: Fetch the authenticated user's encrypted backup blob
       description: >-
-        Returns recent delivery attempts for the endpoint, including status,
-        attempt count, response code and whether the event is dead-lettered.
+        Returns the stored ciphertext blob and its non-secret metadata. The
+        client derives the wrapping key locally and decrypts. Rate limited per
+        user.
+      operationId: getKeyBackup
       security:
         - bearerAuth: []
       parameters:
         - $ref: "#/components/parameters/RequestId"
-        - name: status
-          in: query
-          required: false
-          schema:
-            type: string
-            enum: [pending, delivered, failed, dead_letter]
-        - name: limit
-          in: query
-          required: false
-          schema:
-            type: integer
-            minimum: 1
-            maximum: 100
-            default: 50
       responses:
-        '200':
-          description: Delivery logs
+        "200":
+          description: Backup found.
           headers:
             X-Request-Id:
               $ref: "#/components/headers/X-Request-Id"
           content:
             application/json:
               schema:
-                type: object
-                required: [deliveries]
-                properties:
-                  deliveries:
-                    type: array
-                    items: { $ref: "#/components/schemas/WebhookDelivery" }
-        default:
-          $ref: "#/components/responses/Error"
-  /api/v1/webhooks/deliveries/{deliveryId}/replay:
-    parameters:
-      - name: deliveryId
-        in: path
-        required: true
-        schema:
-          type: string
-          format: uuid
-    post:
-      summary: Replay a dead-lettered delivery
+                $ref: "#/components/schemas/KeyBackupBlob"
+        "401":
+          description: Missing or invalid bearer token.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: No backup stored for this user (`BACKUP_NOT_FOUND`).
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          description: Rate limit exceeded (`BACKUP_RATE_LIMITED`).
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    delete:
+      summary: Delete the authenticated user's encrypted backup blob
+      operationId: deleteKeyBackup
       security:
         - bearerAuth: []
       parameters:
         - $ref: "#/components/parameters/RequestId"
       responses:
-        '202':
-          description: Replay queued
+        "204":
+          description: Backup deleted (idempotent).
           headers:
             X-Request-Id:
               $ref: "#/components/headers/X-Request-Id"
-        default:
-          $ref: "#/components/responses/Error"
+        "401":
+          description: Missing or invalid bearer token.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          description: Rate limit exceeded (`BACKUP_RATE_LIMITED`).
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 components:
   securitySchemes:
     bearerAuth:
@@ -284,106 +248,85 @@ components:
   schemas:
     ErrorResponse:
       $ref: "./openapi-errors.yaml#/components/schemas/ErrorResponse"
-    WebhookEventType:
-      type: string
-      enum:
-        - wallet.created
-        - wallet.updated
-        - transaction.created
-        - transaction.confirmed
-        - transaction.failed
-        - payment.received
-        - payment.sent
-      description: Wallet event an endpoint can subscribe to.
-    WebhookEndpointInput:
+    KeyBackupKdf:
       type: object
-      required: [url, events]
+      description: >-
+        Non-secret KDF parameters the client used to derive the wrapping key.
+        Stored alongside the ciphertext so recovery can re-derive the key. The
+        salt is public; the passphrase and derived key are never sent.
+      required: [algorithm, salt, memoryKiB, iterations, parallelism]
       properties:
-        url:
+        algorithm:
           type: string
-          format: uri
+          enum: [argon2id, passkey-prf]
+        salt:
+          type: string
+          description: Base64-encoded random salt (>= 16 bytes).
+          example: "3q2+7w=="
+        memoryKiB:
+          type: integer
+          minimum: 19456
+          description: Argon2id memory cost in KiB (OWASP minimum 19456).
+          example: 65536
+        iterations:
+          type: integer
+          minimum: 2
+          example: 3
+        parallelism:
+          type: integer
+          minimum: 1
+          example: 1
+    KeyBackupUpload:
+      type: object
+      required: [version, cipher, ciphertext, nonce, kdf]
+      properties:
+        version:
+          type: integer
+          enum: [1]
+          description: Backup format version.
+        cipher:
+          type: string
+          enum: [xchacha20poly1305]
+          description: AEAD used to wrap the secret on the client.
+        ciphertext:
+          type: string
           description: >-
-            HTTPS delivery URL. Must not resolve to a private/internal
-            address (SSRF-safe).
-          example: "https://integrator.example.com/hooks/wallet"
-        events:
-          type: array
-          minItems: 1
-          items: { $ref: "#/components/schemas/WebhookEventType" }
-        description:
+            Base64-encoded AEAD ciphertext (includes the auth tag). Opaque to
+            the server. Maximum 8 KiB decoded.
+          example: "9xQ7..."
+        nonce:
           type: string
-          maxLength: 200
-    WebhookEndpoint:
+          description: Base64-encoded 24-byte XChaCha20 nonce.
+          example: "AAAAAAAAAAAAAAAAAAAAAAAA"
+        kdf:
+          $ref: "#/components/schemas/KeyBackupKdf"
+    KeyBackupMetadata:
       type: object
-      required: [id, url, events, status, createdAt]
+      required: [version, cipher, kdf, updatedAt]
       properties:
-        id:
+        version:
+          type: integer
+          enum: [1]
+        cipher:
           type: string
-          format: uuid
-        url:
-          type: string
-          format: uri
-        events:
-          type: array
-          items: { $ref: "#/components/schemas/WebhookEventType" }
-        description:
-          type: string
-        status:
-          type: string
-          enum: [active, disabled]
-        createdAt:
+          enum: [xchacha20poly1305]
+        kdf:
+          $ref: "#/components/schemas/KeyBackupKdf"
+        updatedAt:
           type: string
           format: date-time
-        secretRotatedAt:
-          type: string
-          format: date-time
-          nullable: true
-    WebhookEndpointWithSecret:
+    KeyBackupBlob:
       allOf:
-        - $ref: "#/components/schemas/WebhookEndpoint"
+        - $ref: "#/components/schemas/KeyBackupMetadata"
         - type: object
-          required: [secret]
+          required: [ciphertext, nonce]
           properties:
-            secret:
+            ciphertext:
               type: string
-              description: >-
-                HMAC signing secret. Returned only on creation and rotation;
-                never on subsequent reads.
-    WebhookDelivery:
-      type: object
-      required: [id, endpointId, eventType, status, attempts, createdAt]
-      properties:
-        id:
-          type: string
-          format: uuid
-        endpointId:
-          type: string
-          format: uuid
-        eventType:
-          $ref: "#/components/schemas/WebhookEventType"
-        status:
-          type: string
-          enum: [pending, delivered, failed, dead_letter]
-        attempts:
-          type: integer
-          minimum: 0
-        responseCode:
-          type: integer
-          nullable: true
-        lastError:
-          type: string
-          nullable: true
-        nextAttemptAt:
-          type: string
-          format: date-time
-          nullable: true
-        createdAt:
-          type: string
-          format: date-time
-        deliveredAt:
-          type: string
-          format: date-time
-          nullable: true
+              description: Base64-encoded AEAD ciphertext. Opaque to the server.
+            nonce:
+              type: string
+              description: Base64-encoded 24-byte XChaCha20 nonce.
     Amount:
       type: string
       pattern: '^\d+(\.\d{1,7})?$'
