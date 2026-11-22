@@ -110,3 +110,8 @@ flowchart LR
 ## ⚠️ Status
 
 This project is in **active development on Stellar testnet**. It has not been audited, so do not use it with real funds.
+
+## Handsoff notes
+
+<!-- handsoff-issue-276 -->
+- #276: Shamir secret sharing for guardian-assisted off-chain key recovery
