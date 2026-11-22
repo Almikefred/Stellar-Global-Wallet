@@ -21,6 +21,9 @@ Doing #258 before #259 means the anchor routes start out as thin handlers
 instead of adding a third large route file. #287 is independent and can land in
 parallel.
 
+#274 is independent of the route/cache work but reuses the #256 error envelope
+and stable error codes for its blob API.
+
 > **Note on line counts.** The issues quote file sizes from commit `6fc71e5`
 > (e.g. `wallet.ts` 674 lines, `jsonCache.ts`, `ttlCache.ts`). That commit is
 > not in this repository's history. On `main`, `wallet.ts` is 344 lines,
